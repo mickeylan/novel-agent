@@ -1,0 +1,17 @@
+# Environment files with secrets
+.env
+api_key.txt
+*.key
+secrets/
+
+# Binary
+novel-agent.exe
+novel-agent
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

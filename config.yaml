@@ -1,0 +1,38 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  mode: "debug"  # debug, release, test
+
+database:
+  host: "127.0.0.1"
+  port: 5432
+  user: "novel_agent"
+  password: "novel_agent"
+  dbname: "novel_agent"
+  sslmode: "disable"
+  search_path: "novel_agent"
+  max_open_conns: 25
+  max_idle_conns: 5
+
+llm:
+  provider: "modelscope"  # modelscope, openai, ollama
+  api_key: "${MODELSCOPE_API_KEY}"
+  base_url: "https://coding.dashscope.aliyuncs.com/v1"
+  model: "qwen3.5-plus"
+  embedding_model: "bge-m3"
+  temperature: 0.7
+  max_tokens: 32000
+
+vector:
+  dimension: 1024
+  index_type: "ivfflat"
+  metric: "cosine"
+
+embedding:
+  base_url: "http://10.0.0.200:8081"
+  model: "bge-m3-Q4_K_M.gguf"
+  dimension: 1024
+
+logging:
+  level: "info"
+  format: "text"  # text, json
