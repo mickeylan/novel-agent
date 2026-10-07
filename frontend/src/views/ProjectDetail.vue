@@ -8,8 +8,8 @@
         </button>
         <div class="project-title">
           <h1>{{ project?.title || '加载中...' }}</h1>
-          <span v-if="project?.genre?.length" class="genre-tags">
-            <span v-for="g in project.genre" :key="g" class="genre-tag">{{ g }}</span>
+          <span v-if="project?.genres?.length" class="genre-tags">
+            <span v-for="g in project.genres" :key="g" class="genre-tag">{{ g }}</span>
           </span>
         </div>
       </div>

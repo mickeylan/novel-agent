@@ -1,14 +1,19 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +24,19 @@ import (
 type Provider interface {
 	Generate(ctx context.Context, prompt string, opts ...Option) (string, error)
 	GenerateJSON(ctx context.Context, prompt string, opts ...Option) (map[string]interface{}, error)
+}
+
+type ProviderHTTPError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *ProviderHTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("API error: %d", e.StatusCode)
+	}
+	return fmt.Sprintf("API error: %d - %s", e.StatusCode, e.Body)
 }
 
 type Option func(*Options)
@@ -55,10 +73,65 @@ func DefaultOptions() *Options {
 	return &Options{
 		Temperature: 0.7,
 		MaxTokens:   32000,
-		TopP:       0.9,
+		TopP:        0.9,
 		Timeout:     300,
 		Stream:      false,
 	}
+}
+
+const (
+	maxLLMOutputTokens  = 40000
+	maxLLMTimeoutSecond = 1200
+)
+
+func resolveOptions(opts ...Option) (*Options, error) {
+	options := DefaultOptions()
+	for _, opt := range opts {
+		if opt != nil {
+			opt(options)
+		}
+	}
+	if math.IsNaN(options.Temperature) || math.IsInf(options.Temperature, 0) || options.Temperature < 0 || options.Temperature > 2 {
+		return nil, fmt.Errorf("temperature must be between 0 and 2")
+	}
+	if math.IsNaN(options.TopP) || math.IsInf(options.TopP, 0) || options.TopP <= 0 || options.TopP > 1 {
+		return nil, fmt.Errorf("top_p must be greater than 0 and at most 1")
+	}
+	if options.MaxTokens < 1 || options.MaxTokens > maxLLMOutputTokens {
+		return nil, fmt.Errorf("max_tokens must be between 1 and %d", maxLLMOutputTokens)
+	}
+	if options.Timeout < 1 || options.Timeout > maxLLMTimeoutSecond {
+		return nil, fmt.Errorf("timeout must be between 1 and %d seconds", maxLLMTimeoutSecond)
+	}
+	return options, nil
+}
+
+func withRequestTimeout(ctx context.Context, timeoutSeconds int) (context.Context, context.CancelFunc) {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = DefaultOptions().Timeout
+	}
+	return context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+}
+
+func openAIEndpoint(baseURL, endpoint string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	endpoint = strings.TrimLeft(endpoint, "/")
+	if strings.HasSuffix(strings.ToLower(baseURL), "/v1") {
+		return baseURL + "/" + endpoint
+	}
+	return baseURL + "/v1/" + endpoint
+}
+
+func newProviderHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = time.Duration(maxLLMTimeoutSecond) * time.Second
+	transport.ExpectContinueTimeout = time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 10
+	return &http.Client{Transport: transport}
 }
 
 // ========== ModelScope Client ==========
@@ -75,15 +148,17 @@ func NewModelScopeClient(apiKey, baseURL, model string) *ModelScopeClient {
 		APIKey:  apiKey,
 		BaseURL: strings.TrimSuffix(baseURL, "/"),
 		Model:   model,
-		Client: &http.Client{Timeout: 5 * time.Minute},
+		Client:  newProviderHTTPClient(),
 	}
 }
 
 func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
-	options := DefaultOptions()
-	for _, opt := range opts {
-		opt(options)
+	options, err := resolveOptions(opts...)
+	if err != nil {
+		return "", err
 	}
+	requestCtx, cancel := withRequestTimeout(ctx, options.Timeout)
+	defer cancel()
 
 	useStream := options.Stream || len(prompt) > 5000
 	systemPrompt := "你是一位专业的小说作家和文学评论家。请始终使用简体中文（Chinese）进行回复，不要用英文。"
@@ -94,13 +169,16 @@ func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": prompt},
 		},
-		"stream": useStream,
+		"temperature": options.Temperature,
+		"top_p":       options.TopP,
+		"max_tokens":  options.MaxTokens,
+		"stream":      useStream,
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	url := c.BaseURL + "/chat/completions"
+	url := openAIEndpoint(c.BaseURL, "chat/completions")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
@@ -114,21 +192,25 @@ func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+		return "", providerHTTPError(resp)
 	}
 
 	if useStream {
 		return c.handleStreamResponse(resp)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	if err != nil {
+		return "", err
+	}
 	var result struct {
 		Choices []struct {
 			Message struct{ Content string } `json:"message"`
 		} `json:"choices"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response")
 	}
@@ -136,19 +218,7 @@ func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...
 }
 
 func (c *ModelScopeClient) handleStreamResponse(resp *http.Response) (string, error) {
-	var builder strings.Builder
-	decoder := json.NewDecoder(resp.Body)
-	for decoder.More() {
-		var data struct {
-			Choices []struct {
-				Delta struct{ Content string } `json:"delta"`
-			} `json:"choices"`
-		}
-		if err := decoder.Decode(&data); err == nil && len(data.Choices) > 0 {
-			builder.WriteString(data.Choices[0].Delta.Content)
-		}
-	}
-	return builder.String(), nil
+	return decodeOpenAIStream(resp.Body)
 }
 
 func (c *ModelScopeClient) GenerateJSON(ctx context.Context, prompt string, opts ...Option) (map[string]interface{}, error) {
@@ -173,15 +243,17 @@ func NewOpenAICompatibleClient(apiKey, baseURL, model string) *OpenAICompatibleC
 		APIKey:  apiKey,
 		BaseURL: strings.TrimSuffix(baseURL, "/"),
 		Model:   model,
-		Client:  &http.Client{Timeout: 10 * time.Minute},
+		Client:  newProviderHTTPClient(),
 	}
 }
 
 func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
-	options := DefaultOptions()
-	for _, opt := range opts {
-		opt(options)
+	options, err := resolveOptions(opts...)
+	if err != nil {
+		return "", err
 	}
+	requestCtx, cancel := withRequestTimeout(ctx, options.Timeout)
+	defer cancel()
 
 	useStream := options.Stream || len(prompt) > 5000
 	systemPrompt := "你是一位专业的小说作家和文学评论家。请始终使用简体中文（Chinese）进行回复，不要用英文。"
@@ -194,16 +266,16 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 		},
 		"temperature": options.Temperature,
 		"top_p":       options.TopP,
-		"stream":       useStream,
+		"stream":      useStream,
 	}
 	if options.MaxTokens > 0 {
 		reqBody["max_tokens"] = options.MaxTokens
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	url := c.BaseURL + "/v1/chat/completions"
+	url := openAIEndpoint(c.BaseURL, "chat/completions")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
@@ -219,24 +291,28 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+		return "", providerHTTPError(resp)
 	}
 
 	if useStream {
 		return c.handleStreamResponse(resp)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	if err != nil {
+		return "", err
+	}
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content           string `json:"content"`
+				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response")
 	}
@@ -250,22 +326,89 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 }
 
 func (c *OpenAICompatibleClient) handleStreamResponse(resp *http.Response) (string, error) {
-	var builder strings.Builder
-	decoder := json.NewDecoder(resp.Body)
-	for decoder.More() {
-		var data struct {
+	return decodeOpenAIStream(resp.Body)
+}
+
+const (
+	maxErrorResponseBytes = 64 << 10
+	maxLLMResponseBytes   = 16 << 20
+	maxStreamEventBytes   = 1 << 20
+	maxStreamOutputBytes  = 16 << 20
+)
+
+func providerHTTPError(resp *http.Response) error {
+	body, err := readBoundedResponse(resp.Body, maxErrorResponseBytes)
+	if err != nil {
+		body = []byte(err.Error())
+	}
+	retryAfter := time.Duration(0)
+	if seconds, parseErr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); parseErr == nil && seconds > 0 {
+		retryAfter = time.Duration(seconds) * time.Second
+	} else if retryAt, dateErr := http.ParseTime(resp.Header.Get("Retry-After")); dateErr == nil {
+		retryAfter = time.Until(retryAt)
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+	}
+	return &ProviderHTTPError{StatusCode: resp.StatusCode, Body: string(body), RetryAfter: retryAfter}
+}
+
+func readBoundedResponse(reader io.Reader, maxBytes int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxBytes)
+	}
+	return body, nil
+}
+
+func decodeOpenAIStream(reader io.Reader) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), maxStreamEventBytes)
+	var content, reasoning strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
+		if line == "[DONE]" {
+			break
+		}
+		var event struct {
 			Choices []struct {
 				Delta struct {
-					Content           string `json:"content"`
+					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
-		if err := decoder.Decode(&data); err == nil && len(data.Choices) > 0 {
-			builder.WriteString(data.Choices[0].Delta.Content)
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return "", fmt.Errorf("failed to parse stream event: %w", err)
+		}
+		if len(event.Choices) == 0 {
+			continue
+		}
+		content.WriteString(event.Choices[0].Delta.Content)
+		reasoning.WriteString(event.Choices[0].Delta.ReasoningContent)
+		if content.Len()+reasoning.Len() > maxStreamOutputBytes {
+			return "", fmt.Errorf("stream response exceeds %d bytes", maxStreamOutputBytes)
 		}
 	}
-	return builder.String(), nil
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read stream response: %w", err)
+	}
+	if content.Len() > 0 {
+		return content.String(), nil
+	}
+	if reasoning.Len() > 0 {
+		return extractNarrative(reasoning.String()), nil
+	}
+	return "", fmt.Errorf("stream response contained no content")
 }
 
 func (c *OpenAICompatibleClient) GenerateJSON(ctx context.Context, prompt string, opts ...Option) (map[string]interface{}, error) {
@@ -288,21 +431,24 @@ func NewOllamaClient(baseURL, model string) *OllamaClient {
 	return &OllamaClient{
 		BaseURL: strings.TrimSuffix(baseURL, "/"),
 		Model:   model,
-		Client:  &http.Client{Timeout: 5 * time.Minute},
+		Client:  newProviderHTTPClient(),
 	}
 }
 
 func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
-	options := DefaultOptions()
-	for _, opt := range opts {
-		opt(options)
+	options, err := resolveOptions(opts...)
+	if err != nil {
+		return "", err
 	}
+	requestCtx, cancel := withRequestTimeout(ctx, options.Timeout)
+	defer cancel()
 
 	reqBody := map[string]interface{}{
-		"model":      c.Model,
-		"prompt":     prompt,
-		"stream":     false,
+		"model":       c.Model,
+		"prompt":      prompt,
+		"stream":      false,
 		"temperature": options.Temperature,
+		"top_p":       options.TopP,
 	}
 	if options.MaxTokens > 0 {
 		reqBody["options"] = map[string]interface{}{
@@ -313,7 +459,7 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Opti
 	jsonData, _ := json.Marshal(reqBody)
 	url := c.BaseURL + "/api/generate"
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
@@ -326,15 +472,22 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Opti
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+		return "", providerHTTPError(resp)
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	if err != nil {
+		return "", err
+	}
 	var result struct {
 		Response string `json:"response"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if result.Response == "" {
+		return "", fmt.Errorf("no response")
+	}
 	return result.Response, nil
 }
 
@@ -350,27 +503,7 @@ func (c *OllamaClient) GenerateJSON(ctx context.Context, prompt string, opts ...
 
 type Client struct {
 	Provider Provider
-	Model   string
-}
-
-// readAPIKey 从文件或环境变量读取 API key
-func readAPIKey(apiKeyOrFile string) string {
-	if apiKeyOrFile == "" {
-		return ""
-	}
-	
-	// 检查是否是文件路径
-	if _, err := os.Stat(apiKeyOrFile); err == nil {
-		// 是文件，读取内容
-		data, err := os.ReadFile(apiKeyOrFile)
-		if err != nil {
-			return ""
-		}
-		return strings.TrimSpace(string(data))
-	}
-	
-	// 直接是 key 内容
-	return apiKeyOrFile
+	Model    string
 }
 
 func NewClient(provider, apiKey, baseURL, model string) *Client {
@@ -407,14 +540,6 @@ func NewClient(provider, apiKey, baseURL, model string) *Client {
 		model = os.Getenv("LLM_MODEL")
 	}
 
-	// 如果没有指定 apiKey，从环境变量获取
-	if apiKey == "" {
-		apiKey = os.Getenv("MODELSCOPE_API_KEY")
-	}
-
-	// 从文件读取 API key（如果 apiKey 是文件路径）
-	apiKey = readAPIKey(apiKey)
-
 	switch provider {
 	case "ollama":
 		// Ollama 使用原生 API
@@ -426,10 +551,6 @@ func NewClient(provider, apiKey, baseURL, model string) *Client {
 		}
 		p = NewOpenAICompatibleClient(apiKey, baseURL, model)
 	case "modelscope":
-		if apiKey == "" {
-			apiKey = os.Getenv("MODELSCOPE_API_KEY")
-			apiKey = readAPIKey(apiKey)
-		}
 		p = NewModelScopeClient(apiKey, baseURL, model)
 	default:
 		// 默认使用 OpenAI 兼容 API
@@ -441,7 +562,7 @@ func NewClient(provider, apiKey, baseURL, model string) *Client {
 
 	return &Client{
 		Provider: p,
-		Model:   model,
+		Model:    model,
 	}
 }
 
@@ -454,40 +575,90 @@ func (c *Client) GenerateJSON(ctx context.Context, prompt string, opts ...Option
 }
 
 func (c *Client) GenerateWithRetry(ctx context.Context, prompt string, maxRetries int, opts ...Option) (string, error) {
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
 	var lastErr error
-	for i := 0; i <= maxRetries; i++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		result, err := c.Generate(ctx, prompt, opts...)
 		if err == nil && result != "" {
 			return result, nil
 		}
+		if err == nil {
+			err = fmt.Errorf("provider returned empty response")
+		}
 		lastErr = err
-		if i < maxRetries {
-			time.Sleep(time.Duration(1<<uint(i)) * time.Second)
+		if attempt == maxRetries || !isRetryableProviderError(err) {
+			return "", err
+		}
+		delay := time.Duration(1<<uint(attempt)) * time.Second
+		var httpErr *ProviderHTTPError
+		if errors.As(err, &httpErr) && httpErr.RetryAfter > delay {
+			delay = httpErr.RetryAfter
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
 		}
 	}
 	return "", lastErr
 }
 
+func isRetryableProviderError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var httpErr *ProviderHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusRequestTimeout || httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+}
+
 // ========== Helper Functions ==========
 
-func extractJSON(content string) string {
-	start := strings.Index(content, "{")
-	end := strings.LastIndex(content, "}")
-	if start == -1 || end == -1 || end < start {
-		start = strings.Index(content, "[")
-		end = strings.LastIndex(content, "]")
+func extractJSONObject(content string) (string, error) {
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```") {
+		firstNewline := strings.IndexByte(content, '\n')
+		lastFence := strings.LastIndex(content, "```")
+		if firstNewline < 0 || lastFence <= firstNewline {
+			return "", fmt.Errorf("invalid JSON code block")
+		}
+		content = strings.TrimSpace(content[firstNewline+1 : lastFence])
 	}
-	if start == -1 || end == -1 || end < start {
-		return content
+	objectStart := strings.Index(content, "{")
+	arrayStart := strings.Index(content, "[")
+	if arrayStart >= 0 && (objectStart < 0 || arrayStart < objectStart) {
+		return "", fmt.Errorf("top-level JSON value must be an object")
 	}
-	return content[start : end+1]
+	objectEnd := strings.LastIndex(content, "}")
+	if objectStart < 0 || objectEnd < objectStart {
+		return "", fmt.Errorf("JSON object not found")
+	}
+	return content[objectStart : objectEnd+1], nil
 }
 
 func parseJSONResponse(content string) (map[string]interface{}, error) {
-	jsonStr := extractJSON(content)
-	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+	jsonStr, err := extractJSONObject(content)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	var result map[string]interface{}
+	decoder := json.NewDecoder(strings.NewReader(jsonStr))
+	if err := decoder.Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("failed to parse JSON: top-level object is empty")
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("failed to parse JSON: multiple top-level values")
 	}
 	return result, nil
 }

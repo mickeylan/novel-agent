@@ -1,12 +1,23 @@
 # Environment files with secrets
 .env
+.env.*
+!.env.example
 api_key.txt
 *.key
+*.pem
+*.p12
+*.pfx
+*.token
+credentials.json
 secrets/
 
 # Binary
 novel-agent.exe
 novel-agent
+
+# Frontend build and dependencies
+frontend/node_modules/
+frontend/dist/
 
 # IDE
 .vscode/

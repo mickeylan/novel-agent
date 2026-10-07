@@ -1,4 +1,5 @@
 import { api } from './index'
+import { withUpdatedAt } from './concurrency'
 
 export const projectApi = {
   // 项目列表
@@ -11,10 +12,13 @@ export const projectApi = {
   get: (id) => api.get(`/projects/${id}`),
   
   // 更新项目
-  update: (id, data) => api.put(`/projects/${id}`, data),
-  
-  // 删除项目
-  delete: (id) => api.delete(`/projects/${id}`)
+  update: (id, data, updatedAt) => api.put(`/projects/${id}`, withUpdatedAt(data, updatedAt)),
+
+  // 只读导出
+  export: (id, format = 'txt') => api.get(`/projects/${id}/export`, {
+    params: { format },
+    responseType: 'blob'
+  })
 }
 
 export default projectApi

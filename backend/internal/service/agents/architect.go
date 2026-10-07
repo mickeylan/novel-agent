@@ -20,35 +20,35 @@ func NewArchitect(client *llm.Client) *Architect {
 
 // ThreeActStructure represents the three-act story structure
 type ThreeActStructure struct {
-	Act1Setup          string `json:"act1_setup"`
+	Act1Setup            string `json:"act1_setup"`
 	Act1IncitingIncident string `json:"act1_inciting_incident"`
-	Act1PlotPoint1    string `json:"act1_plot_point1"`
-	Act2Confrontation string `json:"act2_confrontation"`
-	Act2Midpoint      string `json:"act2_midpoint"`
-	Act2PlotPoint2    string `json:"act2_plot_point2"`
-	Act3Resolution    string `json:"act3_resolution"`
-	Act3Climax        string `json:"act3_climax"`
-	Act3Denouement    string `json:"act3_denouement"`
+	Act1PlotPoint1       string `json:"act1_plot_point1"`
+	Act2Confrontation    string `json:"act2_confrontation"`
+	Act2Midpoint         string `json:"act2_midpoint"`
+	Act2PlotPoint2       string `json:"act2_plot_point2"`
+	Act3Resolution       string `json:"act3_resolution"`
+	Act3Climax           string `json:"act3_climax"`
+	Act3Denouement       string `json:"act3_denouement"`
 }
 
 // ChapterOutline represents a single chapter outline
 type ChapterOutline struct {
-	ChapterNumber     int      `json:"chapter_number"`
-	Title             string   `json:"title"`
-	Summary           string   `json:"summary"`
-	KeyEvents         []string `json:"key_events"`
-	CharacterArcs     []string `json:"character_arcs"`
-	Setting           string   `json:"setting"`
-	Conflict          string   `json:"conflict"`
-	WordCountTarget   int      `json:"word_count_target"`
-	NewCharacters     string   `json:"new_characters"`
-	OpeningType       string   `json:"opening_type"`
-	CliffhangerType   string   `json:"cliffhanger_type"`
-	POV               string   `json:"pov"`
-	Pacing            string   `json:"pacing"`
-	BeatOutline       []string `json:"beat_outline"`
-	HookPlan          string   `json:"hook_plan"`
-	ChapterType       string   `json:"chapter_type"`
+	ChapterNumber   int      `json:"chapter_number"`
+	Title           string   `json:"title"`
+	Summary         string   `json:"summary"`
+	KeyEvents       []string `json:"key_events"`
+	CharacterArcs   []string `json:"character_arcs"`
+	Setting         string   `json:"setting"`
+	Conflict        string   `json:"conflict"`
+	WordCountTarget int      `json:"word_count_target"`
+	NewCharacters   string   `json:"new_characters"`
+	OpeningType     string   `json:"opening_type"`
+	CliffhangerType string   `json:"cliffhanger_type"`
+	POV             string   `json:"pov"`
+	Pacing          string   `json:"pacing"`
+	BeatOutline     []string `json:"beat_outline"`
+	HookPlan        string   `json:"hook_plan"`
+	ChapterType     string   `json:"chapter_type"`
 }
 
 // GenerateThreeActStructure generates a three-act story structure
@@ -102,32 +102,21 @@ func (a *Architect) GenerateThreeActStructure(ctx context.Context, premise, genr
 		return nil, fmt.Errorf("failed to generate three-act structure: %w", err)
 	}
 
-	// Parse the result
-	act1Setup, _ := getString(result, "act1_setup")
-	act1Inciting, _ := getString(result, "act1_inciting_incident")
-	act1PlotPoint, _ := getString(result, "act1_plot_point1")
-	act2Confrontation, _ := getString(result, "act2_confrontation")
-	act2Midpoint, _ := getString(result, "act2_midpoint")
-	act2PlotPoint, _ := getString(result, "act2_plot_point2")
-	act3Resolution, _ := getString(result, "act3_resolution")
-	act3Climax, _ := getString(result, "act3_climax")
-	act3Denouement, _ := getString(result, "act3_denouement")
-
-	return &ThreeActStructure{
-		Act1Setup:          act1Setup,
-		Act1IncitingIncident: act1Inciting,
-		Act1PlotPoint1:    act1PlotPoint,
-		Act2Confrontation: act2Confrontation,
-		Act2Midpoint:      act2Midpoint,
-		Act2PlotPoint2:    act2PlotPoint,
-		Act3Resolution:    act3Resolution,
-		Act3Climax:        act3Climax,
-		Act3Denouement:    act3Denouement,
-	}, nil
+	structure, err := decodeThreeActStructure(result)
+	if err != nil {
+		return nil, fmt.Errorf("invalid three-act structure response: %w", err)
+	}
+	return structure, nil
 }
 
 // GenerateChapterOutline generates an outline for a single chapter
 func (a *Architect) GenerateChapterOutline(ctx context.Context, structure *ThreeActStructure, chapterNum, totalChapters int, premise string) (*ChapterOutline, error) {
+	if structure == nil {
+		return nil, fmt.Errorf("three-act structure is required")
+	}
+	if totalChapters < 1 || chapterNum < 1 || chapterNum > totalChapters {
+		return nil, fmt.Errorf("chapter number must be between 1 and total chapters")
+	}
 	// Determine which act this chapter belongs to
 	var actContent string
 	if chapterNum <= totalChapters/3 {
@@ -164,10 +153,10 @@ func (a *Architect) GenerateChapterOutline(ctx context.Context, structure *Three
   "chapter_type": "章节类型（战斗章/过渡章/高潮章等）",
   "beat_outline": ["节拍1", "节拍2", "节拍3", "节拍4"],
   "hook_plan": "本章如何设置钩子和伏笔"
-}`, chapterNum, premise, 
-	getActLabel(chapterNum, totalChapters), actContent,
-	chapterNum, totalChapters, float64(chapterNum)/float64(totalChapters)*100,
-	chapterNum)
+}`, chapterNum, premise,
+		getActLabel(chapterNum, totalChapters), actContent,
+		chapterNum, totalChapters, float64(chapterNum)/float64(totalChapters)*100,
+		chapterNum)
 
 	result, err := a.client.GenerateJSON(ctx, prompt,
 		llm.WithTemperature(0.6),
@@ -177,48 +166,22 @@ func (a *Architect) GenerateChapterOutline(ctx context.Context, structure *Three
 		return nil, fmt.Errorf("failed to generate chapter outline: %w", err)
 	}
 
-	title, _ := getString(result, "title")
-	summary, _ := getString(result, "summary")
-	setting, _ := getString(result, "setting")
-	conflict, _ := getString(result, "conflict")
-	openingType, _ := getString(result, "opening_type")
-	cliffhanger, _ := getString(result, "cliffhanger_type")
-	chapterType, _ := getString(result, "chapter_type")
-	hookPlan, _ := getString(result, "hook_plan")
-	
-	wordCount := 5000
-	if wc, ok := result["word_count_target"].(float64); ok {
-		wordCount = int(wc)
+	outline, err := decodeChapterOutline(result, chapterNum)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chapter outline response: %w", err)
 	}
-
-	keyEvents := getStringArray(result, "key_events")
-	beatOutline := getStringArray(result, "beat_outline")
-
-	return &ChapterOutline{
-		ChapterNumber:   chapterNum,
-		Title:          title,
-		Summary:        summary,
-		KeyEvents:      keyEvents,
-		Setting:        setting,
-		Conflict:      conflict,
-		WordCountTarget: wordCount,
-		OpeningType:   openingType,
-		CliffhangerType: cliffhanger,
-		ChapterType:   chapterType,
-		BeatOutline:   beatOutline,
-		HookPlan:      hookPlan,
-	}, nil
+	return outline, nil
 }
 
 // FormatOutline formats a chapter outline as a prompt string
 func (a *Architect) FormatOutline(outline *ChapterOutline) string {
 	var sb strings.Builder
-	
+
 	sb.WriteString(fmt.Sprintf("## 第 %d 章：%s\n\n", outline.ChapterNumber, outline.Title))
 	sb.WriteString(fmt.Sprintf("**本章概要：**\n%s\n\n", outline.Summary))
 	sb.WriteString(fmt.Sprintf("**场景设定：**\n%s\n\n", outline.Setting))
 	sb.WriteString(fmt.Sprintf("**核心冲突：**\n%s\n\n", outline.Conflict))
-	
+
 	if len(outline.KeyEvents) > 0 {
 		sb.WriteString("**关键事件：**\n")
 		for i, event := range outline.KeyEvents {
@@ -226,7 +189,7 @@ func (a *Architect) FormatOutline(outline *ChapterOutline) string {
 		}
 		sb.WriteString("\n")
 	}
-	
+
 	if outline.OpeningType != "" {
 		sb.WriteString(fmt.Sprintf("**开头类型：**%s\n", outline.OpeningType))
 	}
@@ -236,21 +199,68 @@ func (a *Architect) FormatOutline(outline *ChapterOutline) string {
 	if outline.ChapterType != "" {
 		sb.WriteString(fmt.Sprintf("**章节类型：**%s\n", outline.ChapterType))
 	}
-	
+
 	if len(outline.BeatOutline) > 0 {
 		sb.WriteString("\n**节拍大纲：**\n")
 		for i, beat := range outline.BeatOutline {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, beat))
 		}
 	}
-	
+
 	if outline.HookPlan != "" {
 		sb.WriteString(fmt.Sprintf("\n**钩子计划：**\n%s\n", outline.HookPlan))
 	}
-	
+
 	sb.WriteString(fmt.Sprintf("\n**目标字数：**%d 字\n", outline.WordCountTarget))
-	
+
 	return sb.String()
+}
+
+func requiredNonEmptyString(result map[string]interface{}, key string) (string, error) {
+	value, ok := result[key].(string)
+	value = strings.TrimSpace(value)
+	if !ok || value == "" {
+		return "", fmt.Errorf("%s must be a non-empty string", key)
+	}
+	return value, nil
+}
+
+func decodeThreeActStructure(result map[string]interface{}) (*ThreeActStructure, error) {
+	keys := []string{"act1_setup", "act1_inciting_incident", "act1_plot_point1", "act2_confrontation", "act2_midpoint", "act2_plot_point2", "act3_resolution", "act3_climax", "act3_denouement"}
+	values := make([]string, len(keys))
+	for index, key := range keys {
+		value, err := requiredNonEmptyString(result, key)
+		if err != nil {
+			return nil, err
+		}
+		values[index] = value
+	}
+	return &ThreeActStructure{Act1Setup: values[0], Act1IncitingIncident: values[1], Act1PlotPoint1: values[2], Act2Confrontation: values[3], Act2Midpoint: values[4], Act2PlotPoint2: values[5], Act3Resolution: values[6], Act3Climax: values[7], Act3Denouement: values[8]}, nil
+}
+
+func decodeChapterOutline(result map[string]interface{}, chapterNumber int) (*ChapterOutline, error) {
+	keys := []string{"title", "summary", "setting", "conflict", "opening_type", "cliffhanger_type", "chapter_type", "hook_plan"}
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		value, err := requiredNonEmptyString(result, key)
+		if err != nil {
+			return nil, err
+		}
+		values[key] = value
+	}
+	keyEvents, err := requiredStringArray(result, "key_events")
+	if err != nil {
+		return nil, err
+	}
+	beats, err := requiredStringArray(result, "beat_outline")
+	if err != nil {
+		return nil, err
+	}
+	wordCount, ok := result["word_count_target"].(float64)
+	if !ok || wordCount != float64(int(wordCount)) || wordCount < 100 || wordCount > 20000 {
+		return nil, fmt.Errorf("word_count_target must be an integer between 100 and 20000")
+	}
+	return &ChapterOutline{ChapterNumber: chapterNumber, Title: values["title"], Summary: values["summary"], KeyEvents: keyEvents, Setting: values["setting"], Conflict: values["conflict"], WordCountTarget: int(wordCount), OpeningType: values["opening_type"], CliffhangerType: values["cliffhanger_type"], ChapterType: values["chapter_type"], BeatOutline: beats, HookPlan: values["hook_plan"]}, nil
 }
 
 // Helper functions
@@ -287,17 +297,17 @@ func getStringArray(m map[string]interface{}, key string) []string {
 // ToJSON converts ThreeActStructure to JSON string
 func (t *ThreeActStructure) ToJSON() (string, error) {
 	data := map[string]string{
-		"act1_setup":            t.Act1Setup,
+		"act1_setup":             t.Act1Setup,
 		"act1_inciting_incident": t.Act1IncitingIncident,
-		"act1_plot_point1":      t.Act1PlotPoint1,
-		"act2_confrontation":    t.Act2Confrontation,
-		"act2_midpoint":         t.Act2Midpoint,
-		"act2_plot_point2":     t.Act2PlotPoint2,
-		"act3_resolution":      t.Act3Resolution,
-		"act3_climax":           t.Act3Climax,
-		"act3_denouement":       t.Act3Denouement,
+		"act1_plot_point1":       t.Act1PlotPoint1,
+		"act2_confrontation":     t.Act2Confrontation,
+		"act2_midpoint":          t.Act2Midpoint,
+		"act2_plot_point2":       t.Act2PlotPoint2,
+		"act3_resolution":        t.Act3Resolution,
+		"act3_climax":            t.Act3Climax,
+		"act3_denouement":        t.Act3Denouement,
 	}
-	
+
 	bytes, err := json.Marshal(data)
 	if err != nil {
 		return "", err

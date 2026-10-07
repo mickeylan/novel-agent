@@ -24,10 +24,14 @@ export const useChapterStore = defineStore('chapter', {
     async fetchChapter(projectId, chapterNum) {
       this.loading = true
       try {
-        this.currentChapter = await api.get(`/projects/${projectId}/chapters/${chapterNum}`)
+        const chapter = await api.get(`/projects/${projectId}/chapters/${chapterNum}`)
+        this.currentChapter = chapter
+        const index = this.chapters.findIndex(item => item.chapter_number === chapterNum)
+        if (index !== -1) this.chapters[index] = chapter
+        return chapter
       } catch (error) {
         console.error('Failed to fetch chapter:', error)
-        this.currentChapter = null
+        throw error
       } finally {
         this.loading = false
       }
@@ -40,8 +44,16 @@ export const useChapterStore = defineStore('chapter', {
       return chapter
     },
     
+    acceptChapter(chapter) {
+      const index = this.chapters.findIndex(item => item.chapter_number === chapter.chapter_number)
+      if (index !== -1) this.chapters[index] = chapter
+      if (this.currentChapter?.chapter_number === chapter.chapter_number) this.currentChapter = chapter
+    },
+
     async updateChapter(projectId, chapterNum, data) {
-      const chapter = await api.put(`/projects/${projectId}/chapters/${chapterNum}`, data)
+      const current = this.chapters.find(c => c.chapter_number === chapterNum) || this.currentChapter
+      if (!current?.updated_at) throw new Error('章节版本缺失，请刷新后重试')
+      const chapter = await api.put(`/projects/${projectId}/chapters/${chapterNum}`, { ...data, updated_at: current.updated_at })
       const index = this.chapters.findIndex(c => c.chapter_number === chapterNum)
       if (index !== -1) {
         this.chapters[index] = chapter
@@ -50,14 +62,6 @@ export const useChapterStore = defineStore('chapter', {
         this.currentChapter = chapter
       }
       return chapter
-    },
-    
-    async deleteChapter(projectId, chapterNum) {
-      await api.delete(`/projects/${projectId}/chapters/${chapterNum}`)
-      this.chapters = this.chapters.filter(c => c.chapter_number !== chapterNum)
-      if (this.currentChapter?.chapter_number === chapterNum) {
-        this.currentChapter = null
-      }
     }
   }
 })

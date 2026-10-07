@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"novel-agent/internal/config"
 	"novel-agent/internal/handlers"
@@ -58,7 +62,7 @@ func main() {
 	}
 
 	if err := cfg.Validate(); err != nil {
-		log.Printf("[config] Warning: %v", err)
+		log.Fatalf("Invalid configuration: %v", err)
 	}
 
 	// 初始化数据库
@@ -82,16 +86,45 @@ func main() {
 	log.Printf("🤖 LLM Provider: %s / %s", cfg.LLM.Provider, cfg.LLM.Model)
 	log.Printf("💾 Database: %s@%s:%d/%s", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
 
-	// 优雅关闭
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// A workflow can perform several sequential 300-second-bounded LLM calls.
+		WriteTimeout: 20 * time.Minute,
+		IdleTimeout:  120 * time.Second,
+	}
 
+	serverErrors := make(chan error, 1)
 	go func() {
-		if err := router.Run(addr); err != nil {
-			log.Fatalf("Failed to start server: %v", err)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
 		}
+		close(serverErrors)
 	}()
 
-	<-quit
-	log.Println("👋 Shutting down server...")
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
+
+	select {
+	case sig := <-quit:
+		log.Printf("👋 Shutting down server after %s...", sig)
+	case err := <-serverErrors:
+		if err != nil {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+		return
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server graceful shutdown timed out: %v", err)
+		if closeErr := server.Close(); closeErr != nil {
+			log.Printf("Server forced close failed: %v", closeErr)
+		}
+	}
+	log.Println("Server stopped")
 }

@@ -40,7 +40,9 @@ export const useProjectStore = defineStore('project', {
     },
     
     async updateProject(id, data) {
-      const project = await api.put(`/projects/${id}`, data)
+      const current = this.projects.find(p => p.id === id) || this.currentProject
+      if (!current?.updated_at) throw new Error('项目版本缺失，请刷新后重试')
+      const project = await api.put(`/projects/${id}`, { ...data, updated_at: current.updated_at })
       const index = this.projects.findIndex(p => p.id === id)
       if (index !== -1) {
         this.projects[index] = project
@@ -49,14 +51,6 @@ export const useProjectStore = defineStore('project', {
         this.currentProject = project
       }
       return project
-    },
-    
-    async deleteProject(id) {
-      await api.delete(`/projects/${id}`)
-      this.projects = this.projects.filter(p => p.id !== id)
-      if (this.currentProject?.id === id) {
-        this.currentProject = null
-      }
     }
   }
 })

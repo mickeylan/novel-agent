@@ -74,11 +74,12 @@ import { ref } from 'vue'
 import { searchApi } from '../api/search'
 
 const searchTypes = [
+  { value: 'hybrid', label: '混合搜索' },
   { value: 'vector', label: '向量搜索' },
   { value: 'keyword', label: '关键词搜索' }
 ]
 
-const currentType = ref('vector')
+const currentType = ref('hybrid')
 const query = ref('')
 const searching = ref(false)
 const hasSearched = ref(false)
@@ -91,11 +92,13 @@ async function doSearch() {
   hasSearched.value = true
   
   try {
-    if (currentType.value === 'vector') {
-      results.value = await searchApi.vector({ query: query.value, limit: 20 })
-    } else {
-      results.value = await searchApi.keyword({ query: query.value, limit: 20 })
-    }
+    const request = { query: query.value.trim(), limit: 20 }
+    const response = currentType.value === 'vector'
+      ? await searchApi.vector(request)
+      : currentType.value === 'keyword'
+        ? await searchApi.keyword(request)
+        : await searchApi.hybrid(request)
+    results.value = response.results || []
   } catch (error) {
     console.error('Search failed:', error)
     results.value = []

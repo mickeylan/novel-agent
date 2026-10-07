@@ -24,7 +24,6 @@
           v-model="premise" 
           class="textarea" 
           placeholder="描述故事的核心设定..."
-          @blur="savePremise"
         ></textarea>
       </section>
       
@@ -34,7 +33,6 @@
           v-model="worldSetting" 
           class="textarea" 
           placeholder="描述故事的世界观..."
-          @blur="saveWorldSetting"
         ></textarea>
       </section>
       
@@ -106,6 +104,7 @@ const worldSetting = ref('')
 const act1Content = ref('')
 const act2Content = ref('')
 const act3Content = ref('')
+const outlineUpdatedAt = ref('')
 
 onMounted(() => {
   loadOutline()
@@ -117,6 +116,7 @@ async function loadOutline() {
     const project = await chapterApi.getOutline(projectId.value)
     premise.value = project.premise || ''
     worldSetting.value = project.world_setting || ''
+    outlineUpdatedAt.value = project.updated_at || ''
     
     // 尝试解析大纲 JSON
     if (project.outline) {
@@ -139,14 +139,6 @@ async function loadOutline() {
   }
 }
 
-async function savePremise() {
-  await saveOutline()
-}
-
-async function saveWorldSetting() {
-  await saveOutline()
-}
-
 async function saveOutline() {
   saving.value = true
   try {
@@ -160,7 +152,8 @@ async function saveOutline() {
       }
     }
     
-    await chapterApi.updateOutline(projectId.value, outlineData)
+    const updated = await chapterApi.updateOutline(projectId.value, outlineData, outlineUpdatedAt.value)
+    outlineUpdatedAt.value = updated.updated_at
   } catch (error) {
     console.error('Failed to save outline:', error)
   } finally {
@@ -186,8 +179,6 @@ async function generateOutline() {
       act2Content.value = result.structure.act2_confrontation || ''
       act3Content.value = result.structure.act3_resolution || ''
     }
-    
-    await saveOutline()
   } catch (error) {
     console.error('Failed to generate outline:', error)
   } finally {

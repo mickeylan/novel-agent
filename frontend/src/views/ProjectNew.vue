@@ -90,7 +90,7 @@ async function handleCreate() {
     
     const project = await projectStore.createProject({
       title: form.value.title,
-      genre: genres,
+      genres,
       premise: form.value.premise || null,
       world_setting: form.value.world_setting || null
     })

@@ -22,11 +22,12 @@ type SearchResult struct {
 
 // RetrievalService handles knowledge base search
 type RetrievalService struct {
-	embedder *llm.EmbedderClient
+	embedder          *llm.EmbedderClient
+	expectedDimension int
 }
 
-func NewRetrievalService(embedder *llm.EmbedderClient) *RetrievalService {
-	return &RetrievalService{embedder: embedder}
+func NewRetrievalService(embedder *llm.EmbedderClient, expectedDimension int) *RetrievalService {
+	return &RetrievalService{embedder: embedder, expectedDimension: expectedDimension}
 }
 
 // VectorSearch performs vector similarity search
@@ -36,6 +37,10 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode query: %w", err)
 	}
+	if err := s.validateEmbedding(queryEmbedding); err != nil {
+		return nil, err
+	}
+	filterGenres = normalizeGenres(filterGenres)
 
 	// Convert to string for SQL
 	embeddingStr := vectorToString(queryEmbedding)
@@ -57,7 +62,7 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 	`
 
 	var results []SearchResult
-	
+
 	rows, err := database.DB.Raw(sql, embeddingStr, filterGenres, limit).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
@@ -70,11 +75,11 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 		if err := rows.Scan(&sr.ChunkID, &sr.Content, &sr.BookTitle, &sr.BookID, &sr.Similarity, &metadata); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		
+
 		if len(metadata) > 0 {
 			sr.Metadata = parseMetadata(metadata)
 		}
-		
+
 		results = append(results, sr)
 	}
 
@@ -88,6 +93,10 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode query: %w", err)
 	}
+	if err := s.validateEmbedding(queryEmbedding); err != nil {
+		return nil, err
+	}
+	filterGenres = normalizeGenres(filterGenres)
 
 	embeddingStr := vectorToString(queryEmbedding)
 
@@ -112,7 +121,7 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 	`
 
 	var results []SearchResult
-	
+
 	rows, err := database.DB.Raw(sql, embeddingStr, filterGenres, limit, queryText).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to hybrid search: %w", err)
@@ -125,11 +134,11 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 		if err := rows.Scan(&sr.ChunkID, &sr.Content, &sr.BookTitle, &sr.BookID, &sr.Similarity, &metadata); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		
+
 		if len(metadata) > 0 {
 			sr.Metadata = parseMetadata(metadata)
 		}
-		
+
 		results = append(results, sr)
 	}
 
@@ -138,6 +147,7 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 
 // KeywordSearch performs full-text keyword search
 func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filterGenres []string, limit int) ([]SearchResult, error) {
+	filterGenres = normalizeGenres(filterGenres)
 	sql := `
 		SELECT 
 			c.id as chunk_id,
@@ -158,7 +168,7 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 	`
 
 	var results []SearchResult
-	
+
 	rows, err := database.DB.Raw(sql, filterGenres, query, limit).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to keyword search: %w", err)
@@ -171,11 +181,11 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 		if err := rows.Scan(&sr.ChunkID, &sr.Content, &sr.BookTitle, &sr.BookID, &sr.Similarity, &metadata); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		
+
 		if len(metadata) > 0 {
 			sr.Metadata = parseMetadata(metadata)
 		}
-		
+
 		results = append(results, sr)
 	}
 
@@ -195,12 +205,13 @@ func (s *RetrievalService) FormatResultsForPrompt(results []SearchResult, maxLen
 		if i >= 5 { // Limit to top 5 results
 			break
 		}
-		
+
 		sb.WriteString(fmt.Sprintf("\n--- 素材 %d：%s ---\n", i+1, r.BookTitle))
-		
+
 		content := r.Content
-		if maxLength > 0 && len(content) > maxLength {
-			content = content[:maxLength] + "..."
+		contentRunes := []rune(content)
+		if maxLength > 0 && len(contentRunes) > maxLength {
+			content = string(contentRunes[:maxLength]) + "..."
 		}
 		sb.WriteString(content)
 		sb.WriteString("\n")
@@ -209,12 +220,36 @@ func (s *RetrievalService) FormatResultsForPrompt(results []SearchResult, maxLen
 	return sb.String()
 }
 
+func (s *RetrievalService) validateEmbedding(embedding []float32) error {
+	if len(embedding) == 0 {
+		return fmt.Errorf("embedding service returned an empty vector")
+	}
+	if s.expectedDimension > 0 && len(embedding) != s.expectedDimension {
+		return fmt.Errorf("embedding dimension mismatch: expected %d, got %d", s.expectedDimension, len(embedding))
+	}
+	return nil
+}
+
+func normalizeGenres(genres []string) []string {
+	result := make([]string, 0, len(genres))
+	for _, genre := range genres {
+		genre = strings.TrimSpace(genre)
+		if genre != "" {
+			result = append(result, genre)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // Helper functions
 func vectorToString(v []float32) string {
 	if len(v) == 0 {
 		return "[]"
 	}
-	
+
 	var sb strings.Builder
 	sb.WriteString("[")
 	for i, f := range v {

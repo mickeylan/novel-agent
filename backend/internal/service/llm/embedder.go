@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -39,11 +38,44 @@ type embedRequest struct {
 	Prompt string `json:"prompt"`
 }
 
-type embedResponse struct {
-	Embeddings [][]float64 `json:"embeddings"`
+const (
+	maxEmbeddingBatchSize  = 128
+	maxEmbeddingInputRunes = 100000
+	maxEmbeddingResponse   = 16 << 20
+)
+
+func validateEmbeddingInputs(texts []string) error {
+	if len(texts) == 0 || len(texts) > maxEmbeddingBatchSize {
+		return fmt.Errorf("embedding batch size must be between 1 and %d", maxEmbeddingBatchSize)
+	}
+	total := 0
+	for index, text := range texts {
+		if strings.TrimSpace(text) == "" {
+			return fmt.Errorf("embedding input %d is empty", index)
+		}
+		total += len([]rune(text))
+		if total > maxEmbeddingInputRunes {
+			return fmt.Errorf("embedding batch exceeds %d characters", maxEmbeddingInputRunes)
+		}
+	}
+	return nil
+}
+
+func convertEmbedding(values []float64) ([]float32, error) {
+	if len(values) == 0 {
+		return nil, fmt.Errorf("embedding response is empty")
+	}
+	embedding := make([]float32, len(values))
+	for index, value := range values {
+		embedding[index] = float32(value)
+	}
+	return embedding, nil
 }
 
 func (e *OllamaEmbedder) Encode(ctx context.Context, text string) ([]float32, error) {
+	if err := validateEmbeddingInputs([]string{text}); err != nil {
+		return nil, err
+	}
 	reqBody := embedRequest{
 		Model:  e.Model,
 		Prompt: text,
@@ -69,36 +101,36 @@ func (e *OllamaEmbedder) Encode(ctx context.Context, text string) ([]float32, er
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := readBoundedResponse(resp.Body, maxErrorResponseBytes)
+		if readErr != nil {
+			return nil, fmt.Errorf("API error: status %d (%v)", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxEmbeddingResponse)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
 
 	// Ollama returns {"embedding": [...]} not {"embeddings": [[...]]}
 	var singleResp struct {
 		Embedding []float64 `json:"embedding"`
 	}
-	
+
 	if err := json.Unmarshal(body, &singleResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Convert []float64 to []float32
-	embedding := make([]float32, len(singleResp.Embedding))
-	for i, v := range singleResp.Embedding {
-		embedding[i] = float32(v)
-	}
-
-	return embedding, nil
+	return convertEmbedding(singleResp.Embedding)
 }
 
 func (e *OllamaEmbedder) EncodeBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if err := validateEmbeddingInputs(texts); err != nil {
+		return nil, err
+	}
 	embeddings := make([][]float32, len(texts))
-	
+
 	for i, text := range texts {
 		emb, err := e.Encode(ctx, text)
 		if err != nil {
@@ -106,7 +138,7 @@ func (e *OllamaEmbedder) EncodeBatch(ctx context.Context, texts []string) ([][]f
 		}
 		embeddings[i] = emb
 	}
-	
+
 	return embeddings, nil
 }
 
@@ -147,9 +179,12 @@ func (e *OpenAICompatibleEmbedder) Encode(ctx context.Context, text string) ([]f
 }
 
 func (e *OpenAICompatibleEmbedder) EncodeBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if err := validateEmbeddingInputs(texts); err != nil {
+		return nil, err
+	}
 	reqBody := openAIEmbedRequest{
-		Model:  e.Model,
-		Input:  texts,
+		Model: e.Model,
+		Input: texts,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -157,7 +192,7 @@ func (e *OpenAICompatibleEmbedder) EncodeBatch(ctx context.Context, texts []stri
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	url := e.BaseURL + "/v1/embeddings"
+	url := openAIEndpoint(e.BaseURL, "embeddings")
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -172,13 +207,16 @@ func (e *OpenAICompatibleEmbedder) EncodeBatch(ctx context.Context, texts []stri
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := readBoundedResponse(resp.Body, maxErrorResponseBytes)
+		if readErr != nil {
+			return nil, fmt.Errorf("API error: status %d (%v)", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("API error: status %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedResponse(resp.Body, maxEmbeddingResponse)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
 	}
 
 	var embedResp openAIEmbedResponse
@@ -186,13 +224,22 @@ func (e *OpenAICompatibleEmbedder) EncodeBatch(ctx context.Context, texts []stri
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
+	if len(embedResp.Data) != len(texts) {
+		return nil, fmt.Errorf("embedding response count %d does not match input count %d", len(embedResp.Data), len(texts))
+	}
 	embeddings := make([][]float32, len(embedResp.Data))
-	for i, data := range embedResp.Data {
-		embedding := make([]float32, len(data.Embedding))
-		for j, v := range data.Embedding {
-			embedding[j] = float32(v)
+	dimension := 0
+	for index, data := range embedResp.Data {
+		embedding, err := convertEmbedding(data.Embedding)
+		if err != nil {
+			return nil, fmt.Errorf("invalid embedding %d: %w", index, err)
 		}
-		embeddings[i] = embedding
+		if dimension == 0 {
+			dimension = len(embedding)
+		} else if len(embedding) != dimension {
+			return nil, fmt.Errorf("embedding %d dimension %d does not match %d", index, len(embedding), dimension)
+		}
+		embeddings[index] = embedding
 	}
 
 	return embeddings, nil
@@ -201,12 +248,12 @@ func (e *OpenAICompatibleEmbedder) EncodeBatch(ctx context.Context, texts []stri
 // EmbedderClient wrapper
 type EmbedderClient struct {
 	Embedder Embedder
-	Model   string
+	Model    string
 }
 
 func NewEmbedderClient(provider, baseURL, model string) *EmbedderClient {
 	var embedder Embedder
-	
+
 	switch provider {
 	case "ollama":
 		embedder = NewOllamaEmbedder(baseURL, model)
@@ -216,7 +263,7 @@ func NewEmbedderClient(provider, baseURL, model string) *EmbedderClient {
 
 	return &EmbedderClient{
 		Embedder: embedder,
-		Model:   model,
+		Model:    model,
 	}
 }
 

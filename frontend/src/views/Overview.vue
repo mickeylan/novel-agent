@@ -14,8 +14,8 @@
           <div class="info-item">
             <dt>题材</dt>
             <dd>
-              <span v-for="g in project.genre" :key="g" class="genre-tag">{{ g }}</span>
-              <span v-if="!project.genre?.length" class="text-secondary">未设置</span>
+              <span v-for="g in project.genres" :key="g" class="genre-tag">{{ g }}</span>
+              <span v-if="!project.genres?.length" class="text-secondary">未设置</span>
             </dd>
           </div>
           <div class="info-item">
@@ -69,11 +69,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useProjectStore } from '../stores/project'
 import { useChapterStore } from '../stores/chapter'
-import { chapterApi, characterApi } from '../api'
+import { characterApi } from '../api/character'
 
 const route = useRoute()
 const projectStore = useProjectStore()
@@ -88,14 +88,16 @@ const totalWords = computed(() => {
   }, 0)
 })
 
-const characters = computed(() => [])
+const characters = ref([])
 
 const projectId = computed(() => route.params.id)
 
 onMounted(async () => {
   try {
-    await chapterStore.fetchChapters(projectId.value)
-    // TODO: 获取角色列表
+    await Promise.all([
+      chapterStore.fetchChapters(projectId.value),
+      characterApi.list(projectId.value).then(data => { characters.value = data })
+    ])
   } catch (error) {
     console.error('Failed to fetch overview data:', error)
   }

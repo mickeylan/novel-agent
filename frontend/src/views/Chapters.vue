@@ -2,7 +2,7 @@
   <div class="chapters">
     <header class="page-header">
       <h2 class="page-title">章节管理</h2>
-      <button class="btn btn-primary btn-sm" @click="showCreateModal = true">
+      <button class="btn btn-primary btn-sm" @click="openCreateModal">
         + 新建章节
       </button>
     </header>
@@ -15,7 +15,7 @@
       <div class="icon">📖</div>
       <div class="title">暂无章节</div>
       <div class="desc">创建第一个章节开始创作</div>
-      <button class="btn btn-primary" @click="showCreateModal = true">
+      <button class="btn btn-primary" @click="openCreateModal">
         创建章节
       </button>
     </div>
@@ -42,12 +42,7 @@
           >
             编辑
           </button>
-          <button 
-            class="btn btn-sm btn-danger" 
-            @click.stop="deleteChapter(chapter)"
-          >
-            删除
-          </button>
+
         </div>
       </div>
     </div>
@@ -129,7 +124,6 @@ const projectId = computed(() => route.params.id)
 const chapters = computed(() => chapterStore.chapters)
 
 const showModal = ref(false)
-const showCreateModal = ref(false)
 const editingChapter = ref(null)
 const saving = ref(false)
 
@@ -143,6 +137,13 @@ const form = ref({
 onMounted(() => {
   chapterStore.fetchChapters(projectId.value)
 })
+
+function openCreateModal() {
+  editingChapter.value = null
+  const nextNumber = chapters.value.reduce((max, chapter) => Math.max(max, chapter.chapter_number), 0) + 1
+  form.value = { chapter_number: nextNumber, title: '', outline: '', content: '' }
+  showModal.value = true
+}
 
 function editChapter(chapter) {
   editingChapter.value = chapter
@@ -165,6 +166,7 @@ async function handleSave() {
   saving.value = true
   try {
     const data = {
+      chapter_number: form.value.chapter_number,
       title: form.value.title || null,
       outline: form.value.outline || null,
       content: form.value.content || null
@@ -183,15 +185,6 @@ async function handleSave() {
   }
 }
 
-async function deleteChapter(chapter) {
-  if (!confirm(`确定删除第${chapter.chapter_number}章？`)) return
-  
-  try {
-    await chapterStore.deleteChapter(projectId.value, chapter.chapter_number)
-  } catch (error) {
-    console.error('Failed to delete chapter:', error)
-  }
-}
 </script>
 
 <style scoped>

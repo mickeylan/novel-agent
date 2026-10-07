@@ -2,6 +2,7 @@ package repository
 
 import (
 	"encoding/json"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -35,26 +36,12 @@ func (r *ProjectRepository) ListAll() ([]models.StoryProject, error) {
 	return projects, result.Error
 }
 
-func (r *ProjectRepository) Update(projectID string, updates map[string]interface{}) error {
-	return database.DB.Model(&models.StoryProject{}).Where("id = ?", projectID).Updates(updates).Error
-}
-
-func (r *ProjectRepository) Delete(projectID string) error {
-	return database.DB.Transaction(func(tx *gorm.DB) error {
-		// Delete chapters first
-		if err := tx.Where("project_id = ?", projectID).Delete(&models.Chapter{}).Error; err != nil {
-			return err
-		}
-		// Delete characters
-		if err := tx.Where("project_id = ?", projectID).Delete(&models.Character{}).Error; err != nil {
-			return err
-		}
-		// Delete project
-		if err := tx.Where("id = ?", projectID).Delete(&models.StoryProject{}).Error; err != nil {
-			return err
-		}
-		return nil
-	})
+func (r *ProjectRepository) UpdateIfUnchanged(projectID string, expectedUpdatedAt time.Time, updates map[string]interface{}) (int64, error) {
+	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	result := database.DB.Model(&models.StoryProject{}).
+		Where("id = ? AND updated_at = ?", projectID, expectedUpdatedAt).
+		Updates(updates)
+	return result.RowsAffected, result.Error
 }
 
 // ========== Chapter Repository ==========
@@ -94,12 +81,12 @@ func (r *ChapterRepository) GetByProject(projectID string) ([]models.Chapter, er
 	return chapters, result.Error
 }
 
-func (r *ChapterRepository) Update(projectID string, chapterNumber int, updates map[string]interface{}) error {
-	return database.DB.Model(&models.Chapter{}).Where("project_id = ? AND chapter_number = ?", projectID, chapterNumber).Updates(updates).Error
-}
-
-func (r *ChapterRepository) Delete(projectID string, chapterNumber int) error {
-	return database.DB.Where("project_id = ? AND chapter_number = ?", projectID, chapterNumber).Delete(&models.Chapter{}).Error
+func (r *ChapterRepository) UpdateIfUnchanged(projectID string, chapterNumber int, expectedUpdatedAt time.Time, updates map[string]interface{}) (int64, error) {
+	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	result := database.DB.Model(&models.Chapter{}).
+		Where("project_id = ? AND chapter_number = ? AND updated_at = ?", projectID, chapterNumber, expectedUpdatedAt).
+		Updates(updates)
+	return result.RowsAffected, result.Error
 }
 
 // ========== Character Repository ==========
@@ -134,18 +121,18 @@ func (r *CharacterRepository) GetByProject(projectID string) ([]models.Character
 	return characters, result.Error
 }
 
-func (r *CharacterRepository) Update(characterID string, updates map[string]interface{}) error {
+func (r *CharacterRepository) UpdateIfUnchanged(projectID, characterID string, expectedUpdatedAt time.Time, updates map[string]interface{}) (int64, error) {
 	if rel, ok := updates["relationships"]; ok {
 		if relMap, ok := rel.(map[string]string); ok {
 			data, _ := json.Marshal(relMap)
 			updates["relationships"] = data
 		}
 	}
-	return database.DB.Model(&models.Character{}).Where("id = ?", characterID).Updates(updates).Error
-}
-
-func (r *CharacterRepository) Delete(characterID string) error {
-	return database.DB.Where("id = ?", characterID).Delete(&models.Character{}).Error
+	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	result := database.DB.Model(&models.Character{}).
+		Where("project_id = ? AND id = ? AND updated_at = ?", projectID, characterID, expectedUpdatedAt).
+		Updates(updates)
+	return result.RowsAffected, result.Error
 }
 
 // ========== BookChunk Repository ==========
@@ -158,7 +145,7 @@ func NewBookChunkRepository() *BookChunkRepository {
 
 func (r *BookChunkRepository) SearchSimilar(queryEmbedding []float32, filterGenre []string, limit int) ([]models.SearchResult, error) {
 	var results []models.SearchResult
-	
+
 	query := `
 		SELECT 
 			c.id as chunk_id,
@@ -173,7 +160,7 @@ func (r *BookChunkRepository) SearchSimilar(queryEmbedding []float32, filterGenr
 		ORDER BY c.embedding <=> ?::vector
 		LIMIT ?
 	`
-	
+
 	rows, err := database.DB.Raw(query, queryEmbedding, filterGenre, filterGenre, queryEmbedding, limit).Rows()
 	if err != nil {
 		return nil, err

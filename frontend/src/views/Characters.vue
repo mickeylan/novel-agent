@@ -40,9 +40,6 @@
         <p class="char-arc">{{ char.arc_summary || '暂无角色弧光' }}</p>
         <div class="char-footer">
           <span class="char-state">{{ char.current_state || '未设置当前状态' }}</span>
-          <button class="btn btn-sm btn-danger" @click="deleteCharacter(char)">
-            删除
-          </button>
         </div>
       </div>
     </div>
@@ -108,7 +105,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { characterApi } from '../api'
+import { characterApi } from '../api/character'
 
 const route = useRoute()
 
@@ -172,16 +169,6 @@ async function handleCreate() {
   }
 }
 
-async function deleteCharacter(char) {
-  if (!confirm(`确定删除角色「${char.name}」？`)) return
-  
-  try {
-    await characterApi.delete(projectId.value, char.id)
-    fetchCharacters()
-  } catch (error) {
-    console.error('Failed to delete character:', error)
-  }
-}
 </script>
 
 <style scoped>

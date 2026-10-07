@@ -19,24 +19,24 @@ func NewCritic(client *llm.Client) *Critic {
 
 // AuditResult represents the result of chapter auditing
 type AuditResult struct {
-	OverallScore   float64       `json:"overall_score"`   // 0-10
-	Dimensions    []Dimension    `json:"dimensions"`
-	Issues        []Issue        `json:"issues"`
-	Suggestions   []string       `json:"suggestions"`
-	Summary       string         `json:"summary"`
+	OverallScore float64     `json:"overall_score"` // 0-10
+	Dimensions   []Dimension `json:"dimensions"`
+	Issues       []Issue     `json:"issues"`
+	Suggestions  []string    `json:"suggestions"`
+	Summary      string      `json:"summary"`
 }
 
 type Dimension struct {
 	Name     string  `json:"dimension"`
-	Score    float64 `json:"score"`    // 0-10
+	Score    float64 `json:"score"` // 0-10
 	Feedback string  `json:"feedback"`
 }
 
 type Issue struct {
-	Type        string `json:"type"`         // consistency, pacing, style, etc.
-	Severity    string `json:"severity"`     // critical, warning, minor
+	Type        string `json:"type"`     // consistency, pacing, style, etc.
+	Severity    string `json:"severity"` // critical, warning, minor
 	Description string `json:"description"`
-	Location    string `json:"location"`     // where the issue occurs
+	Location    string `json:"location"` // where the issue occurs
 }
 
 // AuditChapter performs a comprehensive audit of a chapter
@@ -78,7 +78,7 @@ func (c *Critic) AuditChapter(ctx context.Context, chapterContent, previousChapt
   "suggestions": ["建议加强人物心理描写", "注意避免重复用词"],
   "summary": "总体评价..."
 }`, previousChapter, outline, chapterContent)
-	
+
 	result, err := c.client.GenerateJSON(ctx, prompt,
 		llm.WithTemperature(0.5),
 		llm.WithMaxTokens(4000),
@@ -87,7 +87,11 @@ func (c *Critic) AuditChapter(ctx context.Context, chapterContent, previousChapt
 		return nil, fmt.Errorf("failed to audit chapter: %w", err)
 	}
 
-	return parseAuditResult(result), nil
+	audit, err := parseAuditResult(result)
+	if err != nil {
+		return nil, fmt.Errorf("invalid audit response: %w", err)
+	}
+	return audit, nil
 }
 
 // QuickAudit performs a quick quality check
@@ -103,7 +107,7 @@ func (c *Critic) QuickAudit(ctx context.Context, chapterContent string) (float64
   "issues": ["问题1", "问题2"],
   "suggestions": ["建议1", "建议2"]
 }`, chapterContent)
-	
+
 	result, err := c.client.GenerateJSON(ctx, prompt,
 		llm.WithTemperature(0.5),
 		llm.WithMaxTokens(2000),
@@ -112,17 +116,14 @@ func (c *Critic) QuickAudit(ctx context.Context, chapterContent string) (float64
 		return 0, nil, fmt.Errorf("failed to quick audit: %w", err)
 	}
 
-	score, _ := result["score"].(float64)
-	
-	var suggestions []string
-	if arr, ok := result["suggestions"].([]interface{}); ok {
-		for _, item := range arr {
-			if s, ok := item.(string); ok {
-				suggestions = append(suggestions, s)
-			}
-		}
+	score, ok := result["score"].(float64)
+	if !ok || score < 0 || score > 10 {
+		return 0, nil, fmt.Errorf("invalid quick audit response: score must be between 0 and 10")
 	}
-
+	suggestions, err := requiredStringArray(result, "suggestions")
+	if err != nil {
+		return 0, nil, fmt.Errorf("invalid quick audit response: %w", err)
+	}
 	return score, suggestions, nil
 }
 
@@ -137,7 +138,7 @@ func (c *Critic) SuggestImprovements(ctx context.Context, chapterContent, auditR
 %s
 
 请列出 3-5 条具体的改进建议，每条建议要明确指出问题和解决方案。`, auditReport, chapterContent)
-	
+
 	suggestions, err := c.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.6),
 		llm.WithMaxTokens(2000),
@@ -181,7 +182,7 @@ func (c *Critic) CheckContinuity(ctx context.Context, currentChapter, previousCh
 - 建议的修复方式
 
 如果没有发现问题，请回复"未发现连贯性问题"。`, previousChapters, currentChapter)
-	
+
 	result, err := c.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.5),
 		llm.WithMaxTokens(3000),
@@ -208,58 +209,54 @@ func (c *Critic) CheckContinuity(ctx context.Context, currentChapter, previousCh
 }
 
 // Helper function to parse audit result
-func parseAuditResult(m map[string]interface{}) *AuditResult {
-	result := &AuditResult{}
-
-	if score, ok := m["overall_score"].(float64); ok {
-		result.OverallScore = score
+func parseAuditResult(m map[string]interface{}) (*AuditResult, error) {
+	score, ok := m["overall_score"].(float64)
+	if !ok || score < 0 || score > 10 {
+		return nil, fmt.Errorf("overall_score must be between 0 and 10")
 	}
-
-	if summary, ok := m["summary"].(string); ok {
-		result.Summary = summary
+	summary, ok := m["summary"].(string)
+	if !ok || strings.TrimSpace(summary) == "" {
+		return nil, fmt.Errorf("summary must be a non-empty string")
 	}
-
-	// Parse dimensions
-	if dims, ok := m["dimensions"].([]interface{}); ok {
-		for _, dim := range dims {
-			if d, ok := dim.(map[string]interface{}); ok {
-				dimension := Dimension{
-					Name: getStringValue(d, "name"),
-				}
-				if s, ok := d["score"].(float64); ok {
-					dimension.Score = s
-				}
-				dimension.Feedback = getStringValue(d, "feedback")
-				result.Dimensions = append(result.Dimensions, dimension)
-			}
+	dims, ok := m["dimensions"].([]interface{})
+	if !ok || len(dims) == 0 {
+		return nil, fmt.Errorf("dimensions must be a non-empty array")
+	}
+	result := &AuditResult{OverallScore: score, Summary: strings.TrimSpace(summary), Dimensions: make([]Dimension, 0, len(dims))}
+	for index, raw := range dims {
+		dimensionMap, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("dimensions[%d] must be an object", index)
 		}
-	}
-
-	// Parse issues
-	if issues, ok := m["issues"].([]interface{}); ok {
-		for _, iss := range issues {
-			if i, ok := iss.(map[string]interface{}); ok {
-				issue := Issue{
-					Type:        getStringValue(i, "type"),
-					Severity:    getStringValue(i, "severity"),
-					Description: getStringValue(i, "description"),
-					Location:    getStringValue(i, "location"),
-				}
-				result.Issues = append(result.Issues, issue)
-			}
+		name, feedback := strings.TrimSpace(getStringValue(dimensionMap, "name")), strings.TrimSpace(getStringValue(dimensionMap, "feedback"))
+		dimensionScore, ok := dimensionMap["score"].(float64)
+		if name == "" || feedback == "" || !ok || dimensionScore < 0 || dimensionScore > 10 {
+			return nil, fmt.Errorf("dimensions[%d] requires name, feedback, and score between 0 and 10", index)
 		}
+		result.Dimensions = append(result.Dimensions, Dimension{Name: name, Score: dimensionScore, Feedback: feedback})
 	}
-
-	// Parse suggestions
-	if suggs, ok := m["suggestions"].([]interface{}); ok {
-		for _, sugg := range suggs {
-			if s, ok := sugg.(string); ok {
-				result.Suggestions = append(result.Suggestions, s)
-			}
+	issues, ok := m["issues"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("issues must be an array")
+	}
+	result.Issues = make([]Issue, 0, len(issues))
+	for index, raw := range issues {
+		issueMap, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("issues[%d] must be an object", index)
 		}
+		issue := Issue{Type: strings.TrimSpace(getStringValue(issueMap, "type")), Severity: strings.ToLower(strings.TrimSpace(getStringValue(issueMap, "severity"))), Description: strings.TrimSpace(getStringValue(issueMap, "description")), Location: strings.TrimSpace(getStringValue(issueMap, "location"))}
+		if issue.Type == "" || issue.Description == "" || issue.Location == "" || (issue.Severity != "critical" && issue.Severity != "warning" && issue.Severity != "minor") {
+			return nil, fmt.Errorf("issues[%d] has invalid required fields", index)
+		}
+		result.Issues = append(result.Issues, issue)
 	}
-
-	return result
+	suggestions, err := requiredStringArray(m, "suggestions")
+	if err != nil {
+		return nil, err
+	}
+	result.Suggestions = suggestions
+	return result, nil
 }
 
 func getStringValue(m map[string]interface{}, key string) string {

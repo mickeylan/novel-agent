@@ -79,19 +79,14 @@
           
           <p class="project-synopsis">{{ project.premise || project.world_setting || '暂无描述' }}</p>
           
-          <div class="project-genres" v-if="project.genre?.length">
-            <span v-for="g in project.genre.slice(0, 3)" :key="g" class="genre-tag">
+          <div class="project-genres" v-if="project.genres?.length">
+            <span v-for="g in project.genres.slice(0, 3)" :key="g" class="genre-tag">
               {{ g }}
             </span>
           </div>
           
           <div class="project-foot">
-            <button 
-              class="btn btn-sm btn-danger" 
-              @click.stop="handleDelete(project)"
-            >
-              删除
-            </button>
+            <span class="data-safety">数据保护已开启</span>
             <span class="go">→</span>
           </div>
         </article>
@@ -218,7 +213,7 @@ async function handleCreate() {
     
     const project = await projectStore.createProject({
       title: createForm.value.title,
-      genre: genres,
+      genres,
       premise: createForm.value.premise || null,
       world_setting: createForm.value.world_setting || null
     })
@@ -233,15 +228,6 @@ async function handleCreate() {
   }
 }
 
-async function handleDelete(project) {
-  if (!confirm(`确定删除项目「${project.title}」？此操作不可恢复。`)) return
-  
-  try {
-    await projectStore.deleteProject(project.id)
-  } catch (error) {
-    console.error('Failed to delete project:', error)
-  }
-}
 </script>
 
 <style scoped>

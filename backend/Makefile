@@ -1,4 +1,4 @@
-.PHONY: build run test clean migrate deps
+.PHONY: build run test clean deps
 
 # Binary name
 BINARY_NAME=novel-agent
@@ -36,10 +36,7 @@ clean:
 	rm -f $(BINARY_NAME)
 	rm -f $(BINARY_NAME).exe
 
-# Initialize database
-migrate:
-	@echo "Running database migrations..."
-	psql -U $(DB_USER) -d $(DB_NAME) -f migrations/001_init.sql
+# Database migrations are intentionally disabled: this service reuses an existing database.
 
 # Development server with hot reload (requires air)
 dev:
@@ -66,7 +63,6 @@ help:
 	@echo "  deps         - Download dependencies"
 	@echo "  fmt          - Format code"
 	@echo "  clean        - Clean build artifacts"
-	@echo "  migrate      - Run database migrations"
 	@echo "  dev          - Run with hot reload"
 	@echo "  build-linux  - Build for Linux"
 	@echo "  build-windows - Build for Windows"
