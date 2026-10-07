@@ -17,9 +17,11 @@ type recordingWriter struct {
 	content       string
 	styleGuide    string
 	memoryContext string
+	called        bool
 }
 
 func (f *recordingWriter) WriteChapter(_ context.Context, _, styleGuide, memoryContext, _ string, _ int) (string, error) {
+	f.called = true
 	f.styleGuide = styleGuide
 	f.memoryContext = memoryContext
 	return f.content, nil
@@ -143,6 +145,24 @@ func TestPreviewChapterOptionallyComparesFinalCandidateStyle(t *testing.T) {
 	}
 	if !hasStep(result.Steps, "style_comparison") {
 		t.Fatalf("expected style comparison step: %#v", result.Steps)
+	}
+}
+
+func TestEstimateOutputTokenBudgetUsesWorstCaseOptionalSteps(t *testing.T) {
+	if got := EstimateOutputTokenBudget(5000, false, false); got != 14000 {
+		t.Fatalf("base budget = %d, want 14000", got)
+	}
+	if got := EstimateOutputTokenBudget(5000, true, true); got != 32000 {
+		t.Fatalf("full budget = %d, want 32000", got)
+	}
+}
+
+func TestPreviewChapterRejectsInsufficientBudgetBeforeWriter(t *testing.T) {
+	writer := &recordingWriter{content: "不应生成"}
+	orchestrator := NewOrchestrator(writer, &fakeCritic{scores: []float64{8}}, fakeReviser{}, agents.NewContinuityValidator(), agents.NewReaderPerspectiveAnalyzer(), nil, nil, nil, nil)
+	_, err := orchestrator.PreviewChapter(context.Background(), PreviewRequest{Outline: "大纲", TargetWordCount: 5000, MaxTotalTokens: 13000})
+	if err == nil || writer.called {
+		t.Fatalf("expected preflight budget rejection, got %v", err)
 	}
 }
 

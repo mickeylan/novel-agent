@@ -1,15 +1,16 @@
 import axios from 'axios'
+import { normalizeApiError } from './error'
+import { attachRequestID } from './requestId'
+import { STANDARD_API_TIMEOUT_MS } from './timeouts'
 
 const api = axios.create({
   baseURL: '/api/v1',
-  timeout: 300000 // 5分钟，用于 AI 生成
+  timeout: STANDARD_API_TIMEOUT_MS
 })
 
 // 请求拦截器
 api.interceptors.request.use(
-  config => {
-    return config
-  },
+  config => attachRequestID(config),
   error => {
     return Promise.reject(error)
   }
@@ -21,8 +22,7 @@ api.interceptors.response.use(
     return response.data
   },
   error => {
-    const message = error.response?.data?.error || error.message || '请求失败'
-    console.error('API Error:', message)
+    error.apiError = normalizeApiError(error)
     return Promise.reject(error)
   }
 )

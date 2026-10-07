@@ -84,7 +84,7 @@ func main() {
 	log.Printf("📖 Docs: http://%s/docs", addr)
 	log.Printf("❤️  Health: http://%s/api/v1/health", addr)
 	log.Printf("🤖 LLM Provider: %s / %s", cfg.LLM.Provider, cfg.LLM.Model)
-	log.Printf("💾 Database: %s@%s:%d/%s", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+	log.Printf("💾 Database pool configured; connectivity is reported by /api/v1/health")
 
 	server := &http.Server{
 		Addr:              addr,
@@ -92,8 +92,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		// A workflow can perform several sequential 300-second-bounded LLM calls.
-		WriteTimeout: 20 * time.Minute,
-		IdleTimeout:  120 * time.Second,
+		WriteTimeout:   20 * time.Minute,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: cfg.Server.MaxHeaderBytes,
 	}
 
 	serverErrors := make(chan error, 1)

@@ -2,6 +2,8 @@ server:
   host: "127.0.0.1"
   port: 8080
   mode: "debug"  # debug, release, test
+  max_concurrent_ai: 4
+  max_header_bytes: 65536
 
 database:
   host: "127.0.0.1"
@@ -13,6 +15,10 @@ database:
   search_path: "novel_agent,public"
   max_open_conns: 25
   max_idle_conns: 5
+  conn_max_lifetime_seconds: 1800
+  conn_max_idle_time_seconds: 300
+  statement_timeout_ms: 15000
+  connect_timeout_seconds: 10
 
 llm:
   provider: "modelscope"  # modelscope, openai, ollama, sglang, llama

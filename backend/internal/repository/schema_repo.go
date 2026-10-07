@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"time"
@@ -52,7 +53,10 @@ var requiredSchema = map[string][]string{
 	"audit_results":    {"id", "chapter_id", "project_id", "auditor_type", "overall_score"},
 }
 
-func (r *SchemaRepository) Inspect() (*SchemaCompatibilityReport, error) {
+func (r *SchemaRepository) Inspect(ctx context.Context) (*SchemaCompatibilityReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if database.DB == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
@@ -72,7 +76,7 @@ WHERE a.attnum > 0
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY c.relname, a.attnum`
 
-	rows, err := database.DB.Raw(query).Rows()
+	rows, err := database.DB.WithContext(ctx).Raw(query).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("inspect schema: %w", err)
 	}
@@ -85,6 +89,9 @@ ORDER BY c.relname, a.attnum`
 			return nil, fmt.Errorf("scan schema metadata: %w", err)
 		}
 		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate schema metadata: %w", err)
 	}
 	return BuildSchemaCompatibilityReport(columns), nil
 }

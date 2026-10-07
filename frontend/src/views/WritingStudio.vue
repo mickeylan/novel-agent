@@ -3,6 +3,10 @@
     <header class="page-header">
       <h2 class="page-title">AI 写作工作室</h2>
     </header>
+    <div v-if="apiErrorMessage" class="api-error" role="alert">
+      <span>{{ apiErrorMessage }}</span>
+      <button type="button" @click="apiErrorMessage = ''">关闭</button>
+    </div>
     
     <div class="studio-layout">
       <!-- 左侧：章节选择 -->
@@ -243,6 +247,21 @@
         <button class="btn btn-sm btn-secondary" @click="dataChangesResult = null">关闭</button>
       </aside>
 
+      <aside v-if="workflowBudgetPreview && !workflowResult" class="generation-panel card">
+        <h3>流水线 Token 预算预检</h3>
+        <div class="reader-scores">
+          <span>预留 <b>{{ workflowBudgetPreview.reserved }}</b></span>
+          <span>上限 <b>{{ workflowBudgetPreview.limit }}</b></span>
+          <span>剩余 <b>{{ workflowBudgetPreview.remaining }}</b></span>
+          <span>可执行 <b>{{ workflowBudgetPreview.executable ? '是' : '否' }}</b></span>
+        </div>
+        <p class="analysis-summary">
+          写作 {{ workflowBudgetPreview.breakdown.write }} · 审核 {{ workflowBudgetPreview.breakdown.audit }} · 修订 {{ workflowBudgetPreview.breakdown.revision }} · 复审 {{ workflowBudgetPreview.breakdown.reaudit }} · 数据提取 {{ workflowBudgetPreview.breakdown.data_extract }}
+        </p>
+        <p class="analysis-summary">纯计算预览，未读取项目数据、未检索 RAG、未调用模型。</p>
+        <button class="btn btn-sm btn-secondary" @click="workflowBudgetPreview = null">关闭</button>
+      </aside>
+
       <aside v-if="workflowResult" class="generation-panel card">
         <h3>创作流水线</h3>
         <div class="reader-scores">
@@ -251,7 +270,11 @@
           <span>Critic <b>{{ workflowResult.passed ? '通过' : '待改进' }}</b></span>
           <span>综合建议 <b>{{ workflowResult.quality_gate?.recommended_pass ? '通过' : '需复核' }}</b></span>
           <span>篇幅 <b>{{ workflowResult.candidate_word_count }}/{{ workflowResult.target_word_count }}</b></span>
+          <span v-if="workflowResult.token_budget">Token 预留 <b>{{ workflowResult.token_budget.reserved }}/{{ workflowResult.token_budget.limit }}</b></span>
         </div>
+        <p v-if="workflowBudgetPreview" class="analysis-summary">
+          最坏情况 Token：写作 {{ workflowBudgetPreview.breakdown.write }}、审核 {{ workflowBudgetPreview.breakdown.audit }}、修订 {{ workflowBudgetPreview.breakdown.revision }}、复审 {{ workflowBudgetPreview.breakdown.reaudit }}、数据提取 {{ workflowBudgetPreview.breakdown.data_extract }}。
+        </p>
         <p v-if="workflowContext" class="analysis-summary">
           已自动使用 {{ workflowContext.character_count }} 个角色和 {{ workflowContext.chapter_count }} 个前文章节的上下文{{ workflowContext.truncated ? '（已截断）' : '' }}。
         </p>
@@ -420,6 +443,12 @@
               max="20000"
             />
           </div>
+
+          <div class="form-group">
+            <label>流水线最坏情况输出 Token 上限</label>
+            <input v-model.number="writeConfig.maxTotalTokens" type="number" class="input" min="1" max="62000" />
+            <span class="text-secondary">写作、审核、一次修订/复审和 DataAgent 会在执行前统一预留。</span>
+          </div>
           
           <div class="modal-actions">
             <button type="button" class="btn btn-secondary" @click="showWriteModal = false">
@@ -467,6 +496,7 @@ import { useChapterStore } from '../stores/chapter'
 import { creationApi } from '../api/creation'
 import { chapterApi } from '../api/chapter'
 import { isSameServerVersion } from '../api/concurrency'
+import { formatApiError } from '../api/error'
 import { buildDraftFilename, buildDraftText } from '../utils/draftExport'
 
 const route = useRoute()
@@ -481,6 +511,7 @@ const savedContent = ref('')
 const hasUnsavedChanges = ref(false)
 const isSaving = ref(false)
 const saveError = ref('')
+const apiErrorMessage = ref('')
 const hasSaveConflict = ref(false)
 const isGenerating = ref(false)
 const generationResult = ref(null)
@@ -497,6 +528,7 @@ const styleResult = ref(null)
 const styleComparison = ref(null)
 const summaryResult = ref(null)
 const workflowResult = ref(null)
+const workflowBudgetPreview = ref(null)
 const workflowContext = ref(null)
 const workflowRAG = ref(null)
 const workflowStyle = ref(null)
@@ -510,6 +542,7 @@ const sceneCoverageResult = ref(null)
 const writeConfig = ref({
   outline: '',
   targetWordCount: 5000,
+  maxTotalTokens: 62000,
   useRAG: false,
   ragQuery: '',
   usePreviousStyle: false,
@@ -532,6 +565,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', warnBeforeUnload)
 })
 
+function reportAPIError(error, fallback) {
+  apiErrorMessage.value = formatApiError(error, fallback)
+}
+
 function selectChapter(ch) {
   if (ch.chapter_number === selectedChapter.value) return
   if (hasUnsavedChanges.value && !window.confirm('当前章节有未保存修改，切换章节将丢失这些修改。确定继续吗？')) return
@@ -540,6 +577,7 @@ function selectChapter(ch) {
   content.value = savedContent.value
   hasUnsavedChanges.value = false
   saveError.value = ''
+  apiErrorMessage.value = ''
   hasSaveConflict.value = false
   generationResult.value = null
   diffResult.value = null
@@ -571,7 +609,7 @@ async function saveContent() {
     saveError.value = hasSaveConflict.value
       ? '保存冲突：服务器内容已更新。本地草稿已保留。'
       : '保存失败，当前草稿已保留。'
-    console.error('Failed to save chapter:', error)
+    reportAPIError(error, saveError.value)
   } finally {
     isSaving.value = false
   }
@@ -620,7 +658,7 @@ async function compareServerVersion() {
   } catch (error) {
     closeServerComparison()
     saveError.value = '读取服务器版本进行对比失败，本地草稿仍保留。'
-    console.error('Failed to compare server version:', error)
+    reportAPIError(error, saveError.value)
   }
 }
 
@@ -647,7 +685,7 @@ async function loadServerVersion() {
     serverComparisonUpdatedAt.value = ''
   } catch (error) {
     saveError.value = '加载服务器版本失败，本地草稿仍保留。'
-    console.error('Failed to load server version:', error)
+    reportAPIError(error, saveError.value)
   }
 }
 
@@ -666,7 +704,7 @@ async function startWrite() {
     
     generationResult.value = result.content
   } catch (error) {
-    console.error('Failed to write chapter:', error)
+    reportAPIError(error, '章节生成失败')
   } finally {
     isGenerating.value = false
   }
@@ -683,14 +721,27 @@ async function startWorkflow() {
   isGenerating.value = true
   generationResult.value = null
   workflowResult.value = null
+  workflowBudgetPreview.value = null
   workflowContext.value = null
   workflowRAG.value = null
   workflowStyle.value = null
   workflowScene.value = null
   try {
+    const budgetResult = await creationApi.workflowBudgetPreview({
+      target_word_count: writeConfig.value.targetWordCount,
+      max_total_tokens: writeConfig.value.maxTotalTokens,
+      auto_revise: true,
+      extract_data_changes: true
+    })
+    workflowBudgetPreview.value = budgetResult.token_budget
+    if (!budgetResult.token_budget.executable) {
+      window.alert(`Token 预算不足：需要 ${budgetResult.token_budget.reserved}，当前上限 ${budgetResult.token_budget.limit}`)
+      return
+    }
     const result = await creationApi.workflowPreview(projectId.value, selectedChapter.value, {
       outline,
       target_word_count: writeConfig.value.targetWordCount,
+      max_total_tokens: writeConfig.value.maxTotalTokens,
       auto_revise: true,
       revision_threshold: 6.0,
       extract_data_changes: true,
@@ -712,7 +763,7 @@ async function startWorkflow() {
     dataChangesResult.value = result.workflow.data_changes || null
     generationResult.value = result.workflow.candidate
   } catch (error) {
-    console.error('Failed to run chapter workflow:', error)
+    reportAPIError(error, '创作流水线执行失败')
   } finally {
     isGenerating.value = false
   }
@@ -738,7 +789,7 @@ async function validateSceneCoverage() {
     })
     sceneCoverageResult.value = result.coverage
   } catch (error) {
-    console.error('Failed to validate scene coverage:', error)
+    reportAPIError(error, '场景覆盖检查失败')
   } finally {
     isGenerating.value = false
   }
@@ -763,7 +814,7 @@ async function previewScenePlan() {
     })
     scenePlanResult.value = result.plan
   } catch (error) {
-    console.error('Failed to preview scene plan:', error)
+    reportAPIError(error, '场景计划预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -794,7 +845,7 @@ async function previewPrompt() {
       rag_limit: 5
     })
   } catch (error) {
-    console.error('Failed to preview writer prompt:', error)
+    reportAPIError(error, 'Writer Prompt 预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -808,7 +859,7 @@ async function previewContext() {
     const result = await creationApi.writingContextPreview(projectId.value, selectedChapter.value)
     contextResult.value = result.context
   } catch (error) {
-    console.error('Failed to build writing context:', error)
+    reportAPIError(error, '写作上下文预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -824,7 +875,7 @@ async function extractDataChanges() {
     })
     dataChangesResult.value = result.changes
   } catch (error) {
-    console.error('Failed to extract data changes:', error)
+    reportAPIError(error, '数据变更提取失败')
   } finally {
     isGenerating.value = false
   }
@@ -843,7 +894,7 @@ async function continueChapter() {
     })
     generationResult.value = result.candidate
   } catch (error) {
-    console.error('Failed to continue chapter:', error)
+    reportAPIError(error, '续写预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -861,7 +912,7 @@ async function rewriteChapter() {
     })
     generationResult.value = result.candidate
   } catch (error) {
-    console.error('Failed to rewrite chapter:', error)
+    reportAPIError(error, '重写预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -875,7 +926,7 @@ async function summarizeChapter() {
     const result = await creationApi.summarizeChapterPreview(projectId.value, selectedChapter.value)
     summaryResult.value = result.summary
   } catch (error) {
-    console.error('Failed to summarize chapter:', error)
+    reportAPIError(error, '章节摘要预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -888,7 +939,7 @@ async function validateContent() {
   try {
     analysisResult.value = await creationApi.validateChapter(projectId.value, selectedChapter.value)
   } catch (error) {
-    console.error('Failed to validate chapter:', error)
+    reportAPIError(error, '连贯性检查失败')
   } finally {
     isGenerating.value = false
   }
@@ -908,7 +959,7 @@ async function analyzeStyle() {
     styleResult.value = result.profile
     styleComparison.value = result.comparison || null
   } catch (error) {
-    console.error('Failed to analyze writing style:', error)
+    reportAPIError(error, '文风分析失败')
   } finally {
     isGenerating.value = false
   }
@@ -922,7 +973,7 @@ async function analyzeAIGC() {
     const result = await creationApi.aigcAnalysis(projectId.value, selectedChapter.value, { content: content.value })
     aigcResult.value = result.analysis
   } catch (error) {
-    console.error('Failed to analyze AIGC patterns:', error)
+    reportAPIError(error, 'AIGC 分析失败')
   } finally {
     isGenerating.value = false
   }
@@ -937,7 +988,7 @@ async function analyzeReader() {
     const result = await creationApi.readerAnalysis(projectId.value, selectedChapter.value)
     readerResult.value = result.analysis
   } catch (error) {
-    console.error('Failed to analyze reader perspective:', error)
+    reportAPIError(error, '读者视角分析失败')
   } finally {
     isGenerating.value = false
   }
@@ -952,7 +1003,7 @@ async function startRevision() {
     const result = await creationApi.reviseChapterPreview(projectId.value, selectedChapter.value)
     generationResult.value = result.revision.candidate
   } catch (error) {
-    console.error('Failed to revise chapter:', error)
+    reportAPIError(error, '修订预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -970,7 +1021,7 @@ async function startPolish() {
     })
     generationResult.value = result.content
   } catch (error) {
-    console.error('Failed to polish chapter:', error)
+    reportAPIError(error, '润色预览失败')
   } finally {
     isGenerating.value = false
   }
@@ -988,7 +1039,7 @@ async function previewCandidateDiff() {
     })
     diffResult.value = result.diff
   } catch (error) {
-    console.error('Failed to preview candidate diff:', error)
+    reportAPIError(error, '候选稿差异预览失败')
   }
 }
 
@@ -1016,6 +1067,27 @@ onBeforeRouteLeave(() => {
 
 .page-header {
   margin-bottom: 16px;
+}
+
+.api-error {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  color: #991b1b;
+  background: #fef2f2;
+  overflow-wrap: anywhere;
+}
+
+.api-error button {
+  flex: none;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
 }
 
 .page-title {

@@ -1,6 +1,19 @@
 package repository
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+func TestSchemaInspectionRejectsCanceledContextBeforeDatabaseAccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := NewSchemaRepository().Inspect(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Inspect returned %v, want context.Canceled", err)
+	}
+}
 
 func TestBuildSchemaCompatibilityReportReportsMissingColumns(t *testing.T) {
 	columns := []SchemaColumn{

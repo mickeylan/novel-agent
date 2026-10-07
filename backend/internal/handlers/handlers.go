@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
 	"novel-agent/internal/models"
 	"novel-agent/internal/repository"
@@ -45,22 +44,37 @@ func NewHandler(svc *service.Service) *Handler {
 }
 
 func (h *Handler) writeInternalError(c *gin.Context, err error) {
-	errorID := uuid.NewString()
-	log.Printf("[error] id=%s method=%s path=%s: %v", errorID, c.Request.Method, c.FullPath(), err)
+	requestID := requestIDFromContext(c)
+	log.Printf("[error] request_id=%s method=%s path=%s: %v", requestID, c.Request.Method, c.FullPath(), err)
 	c.JSON(http.StatusInternalServerError, gin.H{
-		"error":    "internal server error",
-		"code":     "internal_error",
-		"error_id": errorID,
+		"error":      "internal server error",
+		"code":       "internal_error",
+		"error_id":   requestID,
+		"request_id": requestID,
+	})
+}
+
+func (h *Handler) writeCommittedResultUnavailable(c *gin.Context, err error) {
+	requestID := requestIDFromContext(c)
+	log.Printf("[error] request_id=%s method=%s path=%s write_committed_result_unavailable: %v", requestID, c.Request.Method, c.FullPath(), err)
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error":      "write may have succeeded but the saved result could not be loaded",
+		"code":       "write_result_unavailable",
+		"error_id":   requestID,
+		"request_id": requestID,
+		"retry_safe": false,
 	})
 }
 
 // ========== Health Check ==========
 
 func (h *Handler) HealthCheck(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
 	statusCode := http.StatusOK
 	status := "healthy"
 	dbStatus := "connected"
-	if err := database.Ping(); err != nil {
+	if err := database.Ping(ctx); err != nil {
 		statusCode = http.StatusServiceUnavailable
 		status = "unhealthy"
 		dbStatus = "unavailable"
@@ -74,7 +88,9 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 }
 
 func (h *Handler) SchemaCompatibility(c *gin.Context) {
-	report, err := h.schemaRepo.Inspect()
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	report, err := h.schemaRepo.Inspect(ctx)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema inspection unavailable", "code": "schema_inspection_failed"})
 		return
@@ -99,13 +115,17 @@ func (h *Handler) CreateProject(c *gin.Context) {
 		Status:       "draft",
 	}
 
-	id, err := h.projectRepo.Create(project)
+	id, err := h.projectRepo.Create(c.Request.Context(), project)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
 	}
 
-	created, _ := h.projectRepo.GetByID(id)
+	created, err := h.projectRepo.GetByID(c.Request.Context(), id)
+	if err != nil {
+		h.writeCommittedResultUnavailable(c, err)
+		return
+	}
 	c.JSON(http.StatusCreated, models.ProjectResponse{
 		ID:           created.ID,
 		Title:        created.Title,
@@ -119,7 +139,7 @@ func (h *Handler) CreateProject(c *gin.Context) {
 }
 
 func (h *Handler) ListProjects(c *gin.Context) {
-	projects, err := h.projectRepo.ListAll()
+	projects, err := h.projectRepo.ListAll(c.Request.Context())
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -144,7 +164,7 @@ func (h *Handler) ListProjects(c *gin.Context) {
 func (h *Handler) GetProject(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
@@ -176,7 +196,7 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_update"})
 		return
 	}
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
@@ -201,7 +221,7 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one update field is required", "code": "invalid_update"})
 		return
 	}
-	rows, err := h.projectRepo.UpdateIfUnchanged(projectID, req.UpdatedAt, updates)
+	rows, err := h.projectRepo.UpdateIfUnchanged(c.Request.Context(), projectID, req.UpdatedAt, updates)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -210,9 +230,9 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 		h.writeConflict(c, project.UpdatedAt)
 		return
 	}
-	project, err = h.projectRepo.GetByID(projectID)
+	project, err = h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
-		h.writeInternalError(c, err)
+		h.writeCommittedResultUnavailable(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, models.ProjectResponse{ID: project.ID, Title: project.Title, Genres: project.Genre, WorldSetting: project.WorldSetting, Premise: project.Premise, Status: project.Status, CreatedAt: project.CreatedAt, UpdatedAt: project.UpdatedAt})
@@ -239,7 +259,7 @@ func (h *Handler) CreateCharacter(c *gin.Context) {
 		CurrentState:  req.CurrentState,
 	}
 
-	id, err := h.characterRepo.Create(character)
+	id, err := h.characterRepo.Create(c.Request.Context(), character)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -259,7 +279,7 @@ func (h *Handler) CreateCharacter(c *gin.Context) {
 func (h *Handler) ListCharacters(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	characters, err := h.characterRepo.GetByProject(projectID)
+	characters, err := h.characterRepo.GetByProject(c.Request.Context(), projectID)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -286,7 +306,7 @@ func (h *Handler) GetCharacter(c *gin.Context) {
 	projectID := c.Param("project_id")
 	characterID := c.Param("character_id")
 
-	character, err := h.characterRepo.GetByID(characterID)
+	character, err := h.characterRepo.GetByID(c.Request.Context(), characterID)
 	if err != nil || character.ProjectID != projectID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Character not found"})
 		return
@@ -309,7 +329,7 @@ func (h *Handler) GetCharacter(c *gin.Context) {
 func (h *Handler) UpdateCharacter(c *gin.Context) {
 	projectID := c.Param("project_id")
 	characterID := c.Param("character_id")
-	character, err := h.characterRepo.GetByID(characterID)
+	character, err := h.characterRepo.GetByID(c.Request.Context(), characterID)
 	if err != nil || character.ProjectID != projectID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Character not found"})
 		return
@@ -346,7 +366,7 @@ func (h *Handler) UpdateCharacter(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one update field is required", "code": "invalid_update"})
 		return
 	}
-	rows, err := h.characterRepo.UpdateIfUnchanged(projectID, characterID, req.UpdatedAt, updates)
+	rows, err := h.characterRepo.UpdateIfUnchanged(c.Request.Context(), projectID, characterID, req.UpdatedAt, updates)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -355,9 +375,9 @@ func (h *Handler) UpdateCharacter(c *gin.Context) {
 		h.writeConflict(c, character.UpdatedAt)
 		return
 	}
-	updated, err := h.characterRepo.GetByID(characterID)
+	updated, err := h.characterRepo.GetByID(c.Request.Context(), characterID)
 	if err != nil {
-		h.writeInternalError(c, err)
+		h.writeCommittedResultUnavailable(c, err)
 		return
 	}
 	var rel map[string]string
@@ -385,20 +405,24 @@ func (h *Handler) CreateChapter(c *gin.Context) {
 		Status:        "draft",
 	}
 
-	id, err := h.chapterRepo.Create(chapter)
+	id, err := h.chapterRepo.Create(c.Request.Context(), chapter)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
 	}
 
-	created, _ := h.chapterRepo.GetByID(id)
+	created, err := h.chapterRepo.GetByID(c.Request.Context(), id)
+	if err != nil {
+		h.writeCommittedResultUnavailable(c, err)
+		return
+	}
 	c.JSON(http.StatusCreated, h.chapterToResponse(created))
 }
 
 func (h *Handler) ListChapters(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	chapters, err := h.chapterRepo.GetByProject(projectID)
+	chapters, err := h.chapterRepo.GetByProject(c.Request.Context(), projectID)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -415,7 +439,7 @@ func (h *Handler) GetChapter(c *gin.Context) {
 	projectID := c.Param("project_id")
 	chapterNumber := c.Param("chapter_number")
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -434,7 +458,7 @@ func (h *Handler) UpdateChapter(c *gin.Context) {
 		return
 	}
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -455,7 +479,7 @@ func (h *Handler) UpdateChapter(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one update field is required", "code": "invalid_update"})
 		return
 	}
-	rows, err := h.chapterRepo.UpdateIfUnchanged(projectID, mustInt(chapterNumber), req.UpdatedAt, updates)
+	rows, err := h.chapterRepo.UpdateIfUnchanged(c.Request.Context(), projectID, mustInt(chapterNumber), req.UpdatedAt, updates)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -465,7 +489,11 @@ func (h *Handler) UpdateChapter(c *gin.Context) {
 		return
 	}
 
-	updated, _ := h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	updated, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
+	if err != nil {
+		h.writeCommittedResultUnavailable(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, h.chapterToResponse(updated))
 }
 
@@ -542,7 +570,7 @@ func (h *Handler) WriteChapter(c *gin.Context) {
 	// Get previous chapter for context
 	prevChapter := ""
 	if chapterNum > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNum-1); err == nil && prev != nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNum-1); err == nil && prev != nil && prev.Content != nil {
 			// Get last 500 chars of previous chapter
 			prevChapter = *prev.Content
 			if len(prevChapter) > 500 {
@@ -584,7 +612,7 @@ func (h *Handler) AuditChapter(c *gin.Context) {
 		return
 	}
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, req.ChapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, req.ChapterNumber)
 	if err != nil || chapter == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -600,7 +628,7 @@ func (h *Handler) AuditChapter(c *gin.Context) {
 	// Get previous chapter
 	var prevChapter string
 	if req.ChapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, req.ChapterNumber-1); err == nil && prev != nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, req.ChapterNumber-1); err == nil && prev != nil && prev.Content != nil {
 			prevChapter = *prev.Content
 		}
 	}
@@ -637,7 +665,7 @@ func (h *Handler) PolishChapter(c *gin.Context) {
 		return
 	}
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, req.ChapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, req.ChapterNumber)
 	if err != nil || chapter == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -670,7 +698,7 @@ func (h *Handler) PolishChapter(c *gin.Context) {
 func (h *Handler) GetOutline(c *gin.Context) {
 	projectID := c.Param("project_id")
 
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
@@ -710,7 +738,7 @@ func (h *Handler) UpdateOutline(c *gin.Context) {
 		updates["outline"] = string(*req.Structure)
 	}
 
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
@@ -719,7 +747,7 @@ func (h *Handler) UpdateOutline(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one update field is required", "code": "invalid_update"})
 		return
 	}
-	rows, err := h.projectRepo.UpdateIfUnchanged(projectID, req.UpdatedAt, updates)
+	rows, err := h.projectRepo.UpdateIfUnchanged(c.Request.Context(), projectID, req.UpdatedAt, updates)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -728,9 +756,9 @@ func (h *Handler) UpdateOutline(c *gin.Context) {
 		h.writeConflict(c, project.UpdatedAt)
 		return
 	}
-	project, err = h.projectRepo.GetByID(projectID)
+	project, err = h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
-		h.writeInternalError(c, err)
+		h.writeCommittedResultUnavailable(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"project_id": project.ID, "premise": derefString(project.Premise), "world_setting": derefString(project.WorldSetting), "outline": derefString(project.Outline), "updated_at": project.UpdatedAt})
@@ -744,7 +772,7 @@ func (h *Handler) GetChapterOutline(c *gin.Context) {
 	projectID := c.Param("project_id")
 	chapterNumber := c.Param("chapter_number")
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -781,7 +809,7 @@ func (h *Handler) UpdateChapterOutline(c *gin.Context) {
 		updates["outline"] = *req.Outline
 	}
 
-	chapter, err := h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -790,7 +818,7 @@ func (h *Handler) UpdateChapterOutline(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one update field is required", "code": "invalid_update"})
 		return
 	}
-	rows, err := h.chapterRepo.UpdateIfUnchanged(projectID, mustInt(chapterNumber), req.UpdatedAt, updates)
+	rows, err := h.chapterRepo.UpdateIfUnchanged(c.Request.Context(), projectID, mustInt(chapterNumber), req.UpdatedAt, updates)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -800,7 +828,11 @@ func (h *Handler) UpdateChapterOutline(c *gin.Context) {
 		return
 	}
 
-	chapter, _ = h.chapterRepo.GetByNumber(projectID, mustInt(chapterNumber))
+	chapter, err = h.chapterRepo.GetByNumber(c.Request.Context(), projectID, mustInt(chapterNumber))
+	if err != nil {
+		h.writeCommittedResultUnavailable(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"project_id":     projectID,
 		"chapter_number": chapter.ChapterNumber,
@@ -901,7 +933,7 @@ func (h *Handler) SearchHybrid(c *gin.Context) {
 
 func (h *Handler) PreviewRAGContext(c *gin.Context) {
 	projectID := c.Param("project_id")
-	if _, err := h.projectRepo.GetByID(projectID); err != nil {
+	if _, err := h.projectRepo.GetByID(c.Request.Context(), projectID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
 	}
@@ -968,13 +1000,42 @@ func (h *Handler) PreviewWritingContext(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_runes must be between 500 and 12000"})
 		return
 	}
-	writingContext, err := h.buildWritingContext(projectID, chapterNumber, maxRunes)
+	writingContext, err := h.buildWritingContext(c.Request.Context(), projectID, chapterNumber, maxRunes)
 	if err != nil {
 		log.Printf("[context] project=%s chapter=%d: %v", projectID, chapterNumber, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "writing context unavailable", "code": "context_unavailable"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"project_id": projectID, "chapter_number": chapterNumber, "context": writingContext, "preview": true})
+}
+
+func (h *Handler) PreviewWorkflowTokenBudget(c *gin.Context) {
+	var req struct {
+		TargetWordCount    int  `json:"target_word_count"`
+		MaxTotalTokens     int  `json:"max_total_tokens"`
+		AutoRevise         bool `json:"auto_revise"`
+		ExtractDataChanges bool `json:"extract_data_changes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.TargetWordCount == 0 {
+		req.TargetWordCount = 5000
+	}
+	if req.TargetWordCount < 100 || req.TargetWordCount > 20000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "target_word_count must be between 100 and 20000"})
+		return
+	}
+	if req.MaxTotalTokens == 0 {
+		req.MaxTotalTokens = orchestration.MaxWorkflowOutputTokens
+	}
+	if req.MaxTotalTokens < 1 || req.MaxTotalTokens > orchestration.MaxWorkflowOutputTokens {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("max_total_tokens must be between 1 and %d", orchestration.MaxWorkflowOutputTokens)})
+		return
+	}
+	budget := orchestration.BuildTokenBudget(req.TargetWordCount, req.MaxTotalTokens, req.AutoRevise, req.ExtractDataChanges)
+	c.JSON(http.StatusOK, gin.H{"token_budget": budget, "preview": true})
 }
 
 func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
@@ -990,6 +1051,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 		MemoryContext      string   `json:"memory_context"`
 		NewCharacters      []string `json:"new_characters"`
 		TargetWordCount    int      `json:"target_word_count"`
+		MaxTotalTokens     int      `json:"max_total_tokens"`
 		AutoRevise         bool     `json:"auto_revise"`
 		RevisionThreshold  float64  `json:"revision_threshold"`
 		ExtractDataChanges bool     `json:"extract_data_changes"`
@@ -1013,6 +1075,18 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "target_word_count must be between 100 and 20000"})
 		return
 	}
+	if req.MaxTotalTokens == 0 {
+		req.MaxTotalTokens = orchestration.MaxWorkflowOutputTokens
+	}
+	if req.MaxTotalTokens < 1 || req.MaxTotalTokens > orchestration.MaxWorkflowOutputTokens {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("max_total_tokens must be between 1 and %d", orchestration.MaxWorkflowOutputTokens)})
+		return
+	}
+	reservedTokens := orchestration.EstimateOutputTokenBudget(req.TargetWordCount, req.AutoRevise, req.ExtractDataChanges)
+	if reservedTokens > req.MaxTotalTokens {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("workflow requires a worst-case output budget of %d tokens", reservedTokens), "code": "token_budget_exceeded", "required_tokens": reservedTokens, "max_total_tokens": req.MaxTotalTokens})
+		return
+	}
 	if req.RevisionThreshold < 0 || req.RevisionThreshold > 10 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "revision_threshold must be between 0 and 10"})
 		return
@@ -1033,7 +1107,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_scenes must be between 1 and 10"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1048,7 +1122,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 	}
 	previous := ""
 	if chapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1); err == nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber-1); err == nil && prev.Content != nil {
 			runes := []rune(*prev.Content)
 			if len(runes) > 1000 {
 				runes = runes[len(runes)-1000:]
@@ -1059,7 +1133,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 	memoryContext := strings.TrimSpace(req.MemoryContext)
 	var writingContext *agents.WritingContext
 	if memoryContext == "" {
-		builtContext, buildErr := h.buildWritingContext(projectID, chapterNumber, 8000)
+		builtContext, buildErr := h.buildWritingContext(c.Request.Context(), projectID, chapterNumber, 8000)
 		if buildErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": buildErr.Error()})
 			return
@@ -1109,7 +1183,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "style_samples must be between 1 and 5"})
 			return
 		}
-		chapters, loadErr := h.chapterRepo.GetByProject(projectID)
+		chapters, loadErr := h.chapterRepo.GetByProject(c.Request.Context(), projectID)
 		if loadErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": loadErr.Error()})
 			return
@@ -1151,6 +1225,7 @@ func (h *Handler) PreviewChapterWorkflow(c *gin.Context) {
 		PreviousChapter:         previous,
 		NewCharacters:           req.NewCharacters,
 		TargetWordCount:         req.TargetWordCount,
+		MaxTotalTokens:          req.MaxTotalTokens,
 		AutoRevise:              req.AutoRevise,
 		RevisionThreshold:       req.RevisionThreshold,
 		ChapterNumber:           chapterNumber,
@@ -1194,7 +1269,7 @@ func (h *Handler) ValidateChapter(c *gin.Context) {
 			return
 		}
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1205,7 +1280,7 @@ func (h *Handler) ValidateChapter(c *gin.Context) {
 	}
 	previous := ""
 	if chapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1); err == nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber-1); err == nil && prev.Content != nil {
 			previous = *prev.Content
 		}
 	}
@@ -1244,7 +1319,7 @@ func (h *Handler) PreviewChapterDiff(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "original and candidate must not exceed 100000 characters"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1290,7 +1365,7 @@ func (h *Handler) ValidateSceneCoverage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_scenes must be between 1 and 10"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1361,7 +1436,7 @@ func (h *Handler) AnalyzeAIGC(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content must not exceed 100000 characters"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1411,7 +1486,7 @@ func (h *Handler) AnalyzeStyle(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "sample_chapters must be between 1 and 5"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1441,7 +1516,7 @@ func (h *Handler) AnalyzeStyle(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "sample_chapters must be between 1 and 5"})
 			return
 		}
-		chapters, loadErr := h.chapterRepo.GetByProject(projectID)
+		chapters, loadErr := h.chapterRepo.GetByProject(c.Request.Context(), projectID)
 		if loadErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": loadErr.Error()})
 			return
@@ -1474,7 +1549,7 @@ func (h *Handler) PreviewChapterDataChanges(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "content must not exceed 100000 characters and known_context must not exceed 12000 characters"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1528,7 +1603,7 @@ func (h *Handler) ContinueChapterPreview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "target_word_count must be between 100 and 10000"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1566,7 +1641,7 @@ func (h *Handler) RewriteChapterPreview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "instructions must contain 1 to 4000 characters"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1595,7 +1670,7 @@ func (h *Handler) SummarizeChapterPreview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chapter number"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1619,7 +1694,7 @@ func (h *Handler) AnalyzeReaderPerspective(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chapter number"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1639,7 +1714,7 @@ func (h *Handler) ReviseChapterPreview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chapter number"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1650,7 +1725,7 @@ func (h *Handler) ReviseChapterPreview(c *gin.Context) {
 	}
 	previous := ""
 	if chapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1); err == nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber-1); err == nil && prev.Content != nil {
 			previous = *prev.Content
 		}
 	}
@@ -1688,12 +1763,12 @@ func (h *Handler) ExportProject(c *gin.Context) {
 		return
 	}
 
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
 	}
-	chapters, err := h.chapterRepo.GetByProject(projectID)
+	chapters, err := h.chapterRepo.GetByProject(c.Request.Context(), projectID)
 	if err != nil {
 		h.writeInternalError(c, err)
 		return
@@ -1758,7 +1833,7 @@ func (h *Handler) GenerateChapterOutlines(c *gin.Context) {
 		return
 	}
 
-	project, err := h.projectRepo.GetByID(projectID)
+	project, err := h.projectRepo.GetByID(c.Request.Context(), projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Project not found"})
 		return
@@ -1822,7 +1897,7 @@ func (h *Handler) PreviewScenePlan(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_scenes must be between 1 and 10"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1895,7 +1970,7 @@ func (h *Handler) PreviewChapterPrompt(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "max_scenes must be between 1 and 10"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -1915,12 +1990,12 @@ func (h *Handler) PreviewChapterPrompt(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "target_word_count must be between 100 and 20000"})
 		return
 	}
-	previous := h.previousChapterTail(projectID, chapterNumber, 1000)
+	previous := h.previousChapterTail(c.Request.Context(), projectID, chapterNumber, 1000)
 	memoryContext := ""
 	useContext := req.UseContext == nil || *req.UseContext
 	var writingContext *agents.WritingContext
 	if useContext {
-		built, buildErr := h.buildWritingContext(projectID, chapterNumber, 8000)
+		built, buildErr := h.buildWritingContext(c.Request.Context(), projectID, chapterNumber, 8000)
 		if buildErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": buildErr.Error()})
 			return
@@ -1937,7 +2012,7 @@ func (h *Handler) PreviewChapterPrompt(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "style_samples must be between 1 and 5"})
 			return
 		}
-		chapters, loadErr := h.chapterRepo.GetByProject(projectID)
+		chapters, loadErr := h.chapterRepo.GetByProject(c.Request.Context(), projectID)
 		if loadErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": loadErr.Error()})
 			return
@@ -2000,11 +2075,11 @@ func (h *Handler) PreviewChapterPrompt(c *gin.Context) {
 	})
 }
 
-func (h *Handler) previousChapterTail(projectID string, chapterNumber, maxRunes int) string {
+func (h *Handler) previousChapterTail(ctx context.Context, projectID string, chapterNumber, maxRunes int) string {
 	if chapterNumber <= 1 {
 		return ""
 	}
-	previous, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1)
+	previous, err := h.chapterRepo.GetByNumber(ctx, projectID, chapterNumber-1)
 	if err != nil || previous.Content == nil {
 		return ""
 	}
@@ -2022,14 +2097,14 @@ func (h *Handler) GetChapterPrompt(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chapter number"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
 	}
 	previous := ""
 	if chapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1); err == nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber-1); err == nil && prev.Content != nil {
 			runes := []rune(*prev.Content)
 			if len(runes) > 500 {
 				runes = runes[len(runes)-500:]
@@ -2065,7 +2140,7 @@ type EvaluationRequest struct {
 }
 
 func (h *Handler) evaluateChapter(c *gin.Context, projectID string, chapterNumber int) (*agents.AuditResult, error) {
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return nil, err
@@ -2076,7 +2151,7 @@ func (h *Handler) evaluateChapter(c *gin.Context, projectID string, chapterNumbe
 	}
 	previous := ""
 	if chapterNumber > 1 {
-		if prev, err := h.chapterRepo.GetByNumber(projectID, chapterNumber-1); err == nil && prev.Content != nil {
+		if prev, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber-1); err == nil && prev.Content != nil {
 			previous = *prev.Content
 		}
 	}
@@ -2106,7 +2181,7 @@ func (h *Handler) PolishChapterByNumber(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "style_guide must not exceed 4000 characters"})
 		return
 	}
-	chapter, err := h.chapterRepo.GetByNumber(projectID, chapterNumber)
+	chapter, err := h.chapterRepo.GetByNumber(c.Request.Context(), projectID, chapterNumber)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Chapter not found"})
 		return
@@ -2208,16 +2283,16 @@ func searchResponse(query string, results []retrieval.SearchResult) models.Searc
 	return models.SearchResponse{Query: query, Total: len(results), Results: response}
 }
 
-func (h *Handler) buildWritingContext(projectID string, chapterNumber, maxRunes int) (agents.WritingContext, error) {
-	project, err := h.projectRepo.GetByID(projectID)
+func (h *Handler) buildWritingContext(ctx context.Context, projectID string, chapterNumber, maxRunes int) (agents.WritingContext, error) {
+	project, err := h.projectRepo.GetByID(ctx, projectID)
 	if err != nil {
 		return agents.WritingContext{}, fmt.Errorf("project not found")
 	}
-	characters, err := h.characterRepo.GetByProject(projectID)
+	characters, err := h.characterRepo.GetByProject(ctx, projectID)
 	if err != nil {
 		return agents.WritingContext{}, fmt.Errorf("load characters: %w", err)
 	}
-	chapters, err := h.chapterRepo.GetByProject(projectID)
+	chapters, err := h.chapterRepo.GetByProject(ctx, projectID)
 	if err != nil {
 		return agents.WritingContext{}, fmt.Errorf("load chapters: %w", err)
 	}

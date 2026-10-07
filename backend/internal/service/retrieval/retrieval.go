@@ -32,6 +32,9 @@ func NewRetrievalService(embedder *llm.EmbedderClient, expectedDimension int) *R
 
 // VectorSearch performs vector similarity search
 func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filterGenres []string, limit int) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Generate query embedding
 	queryEmbedding, err := s.embedder.Encode(ctx, query)
 	if err != nil {
@@ -63,7 +66,7 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 
 	var results []SearchResult
 
-	rows, err := database.DB.Raw(sql, embeddingStr, filterGenres, limit).Rows()
+	rows, err := database.DB.WithContext(ctx).Raw(sql, embeddingStr, filterGenres, limit).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
 	}
@@ -83,11 +86,17 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 		results = append(results, sr)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate search results: %w", err)
+	}
 	return results, nil
 }
 
 // HybridSearch combines vector and keyword search
 func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, filterGenres []string, limit int) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Generate embedding
 	queryEmbedding, err := s.embedder.Encode(ctx, queryText)
 	if err != nil {
@@ -122,7 +131,7 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 
 	var results []SearchResult
 
-	rows, err := database.DB.Raw(sql, embeddingStr, filterGenres, limit, queryText).Rows()
+	rows, err := database.DB.WithContext(ctx).Raw(sql, embeddingStr, filterGenres, limit, queryText).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to hybrid search: %w", err)
 	}
@@ -142,11 +151,17 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 		results = append(results, sr)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate hybrid search results: %w", err)
+	}
 	return results, nil
 }
 
 // KeywordSearch performs full-text keyword search
 func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filterGenres []string, limit int) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	filterGenres = normalizeGenres(filterGenres)
 	sql := `
 		SELECT 
@@ -169,7 +184,7 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 
 	var results []SearchResult
 
-	rows, err := database.DB.Raw(sql, filterGenres, query, limit).Rows()
+	rows, err := database.DB.WithContext(ctx).Raw(sql, filterGenres, query, limit).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("failed to keyword search: %w", err)
 	}
@@ -189,6 +204,9 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 		results = append(results, sr)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate keyword search results: %w", err)
+	}
 	return results, nil
 }
 

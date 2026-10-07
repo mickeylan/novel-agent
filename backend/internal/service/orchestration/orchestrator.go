@@ -27,6 +27,8 @@ type DataExtractor interface {
 	ExtractPreview(ctx context.Context, chapterNumber int, content, knownContext string) (*agents.DataExtractionPreview, error)
 }
 
+const MaxWorkflowOutputTokens = 62000
+
 type PreviewRequest struct {
 	Outline                 string
 	StyleGuide              string
@@ -34,6 +36,7 @@ type PreviewRequest struct {
 	PreviousChapter         string
 	NewCharacters           []string
 	TargetWordCount         int
+	MaxTotalTokens          int
 	AutoRevise              bool
 	RevisionThreshold       float64
 	ChapterNumber           int
@@ -67,6 +70,23 @@ type QualityGate struct {
 	Advisory        bool           `json:"advisory"`
 }
 
+type TokenBudgetBreakdown struct {
+	Write       int `json:"write"`
+	Audit       int `json:"audit"`
+	Revision    int `json:"revision"`
+	Reaudit     int `json:"reaudit"`
+	DataExtract int `json:"data_extract"`
+}
+
+type TokenBudget struct {
+	Limit      int                  `json:"limit"`
+	Reserved   int                  `json:"reserved"`
+	Remaining  int                  `json:"remaining"`
+	WorstCase  bool                 `json:"worst_case"`
+	Executable bool                 `json:"executable"`
+	Breakdown  TokenBudgetBreakdown `json:"breakdown"`
+}
+
 type ChapterWorkflowPreview struct {
 	Draft              string                         `json:"draft"`
 	Candidate          string                         `json:"candidate"`
@@ -81,6 +101,7 @@ type ChapterWorkflowPreview struct {
 	TargetWordCount    int                            `json:"target_word_count"`
 	CandidateWordCount int                            `json:"candidate_word_count"`
 	WordCountDeviation float64                        `json:"word_count_deviation"`
+	TokenBudget        TokenBudget                    `json:"token_budget"`
 	Steps              []StepResult                   `json:"steps"`
 	Preview            bool                           `json:"preview"`
 	ExecutionTimeMS    int64                          `json:"execution_time_ms"`
@@ -108,6 +129,28 @@ func NewOrchestrator(writer Writer, critic Critic, reviser Reviser, validator *a
 	return &Orchestrator{writer: writer, critic: critic, reviser: reviser, validator: validator, reader: reader, dataAgent: dataAgent, scenePlanner: scenePlanner, aigcDetector: aigcDetector, styleAnalyzer: styleAnalyzer}
 }
 
+func BuildTokenBudget(targetWordCount, limit int, autoRevise, extractDataChanges bool) TokenBudget {
+	if targetWordCount == 0 {
+		targetWordCount = 5000
+	}
+	if limit == 0 {
+		limit = MaxWorkflowOutputTokens
+	}
+	breakdown := TokenBudgetBreakdown{Write: targetWordCount * 2, Audit: 4000}
+	if autoRevise {
+		breakdown.Revision, breakdown.Reaudit = 8000, 4000
+	}
+	if extractDataChanges {
+		breakdown.DataExtract = 6000
+	}
+	reserved := breakdown.Write + breakdown.Audit + breakdown.Revision + breakdown.Reaudit + breakdown.DataExtract
+	return TokenBudget{Limit: limit, Reserved: reserved, Remaining: limit - reserved, WorstCase: true, Executable: reserved <= limit, Breakdown: breakdown}
+}
+
+func EstimateOutputTokenBudget(targetWordCount int, autoRevise, extractDataChanges bool) int {
+	return BuildTokenBudget(targetWordCount, MaxWorkflowOutputTokens, autoRevise, extractDataChanges).Reserved
+}
+
 func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewRequest) (*ChapterWorkflowPreview, error) {
 	started := time.Now()
 	if request.TargetWordCount == 0 {
@@ -116,6 +159,17 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 	if request.TargetWordCount < 100 || request.TargetWordCount > 20000 {
 		return nil, fmt.Errorf("target word count must be between 100 and 20000")
 	}
+	if request.MaxTotalTokens == 0 {
+		request.MaxTotalTokens = MaxWorkflowOutputTokens
+	}
+	if request.MaxTotalTokens < 1 || request.MaxTotalTokens > MaxWorkflowOutputTokens {
+		return nil, fmt.Errorf("max total tokens must be between 1 and %d", MaxWorkflowOutputTokens)
+	}
+	tokenBudget := BuildTokenBudget(request.TargetWordCount, request.MaxTotalTokens, request.AutoRevise, request.ExtractDataChanges)
+	reservedTokens := tokenBudget.Reserved
+	if !tokenBudget.Executable {
+		return nil, fmt.Errorf("workflow output token budget requires %d tokens but limit is %d", reservedTokens, request.MaxTotalTokens)
+	}
 	if request.RevisionThreshold == 0 {
 		request.RevisionThreshold = 6.0
 	}
@@ -123,7 +177,12 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 		return nil, fmt.Errorf("revision threshold must be between 0 and 10")
 	}
 
-	result := &ChapterWorkflowPreview{RevisionThreshold: request.RevisionThreshold, TargetWordCount: request.TargetWordCount, Steps: make([]StepResult, 0, 11), Errors: []string{}, Preview: true}
+	result := &ChapterWorkflowPreview{
+		RevisionThreshold: request.RevisionThreshold,
+		TargetWordCount:   request.TargetWordCount,
+		TokenBudget:       tokenBudget,
+		Steps:             make([]StepResult, 0, 11), Errors: []string{}, Preview: true,
+	}
 
 	draft, err := runStep(&result.Steps, "write", func() (string, error) {
 		return o.writer.WriteChapter(ctx, request.Outline, request.StyleGuide, request.MemoryContext, request.PreviousChapter, request.TargetWordCount)

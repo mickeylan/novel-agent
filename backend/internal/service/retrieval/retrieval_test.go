@@ -1,6 +1,27 @@
 package retrieval
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+func TestSearchesRejectCanceledContextBeforeEmbeddingOrDatabaseAccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	service := &RetrievalService{}
+	for name, search := range map[string]func() error{
+		"vector":  func() error { _, err := service.VectorSearch(ctx, "query", nil, 5); return err },
+		"hybrid":  func() error { _, err := service.HybridSearch(ctx, "query", nil, 5); return err },
+		"keyword": func() error { _, err := service.KeywordSearch(ctx, "query", nil, 5); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := search(); !errors.Is(err, context.Canceled) {
+				t.Fatalf("search returned %v, want context.Canceled", err)
+			}
+		})
+	}
+}
 
 func TestNormalizeGenresReturnsNilForEmptyFilter(t *testing.T) {
 	if result := normalizeGenres([]string{"", "  "}); result != nil {
