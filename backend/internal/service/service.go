@@ -1,6 +1,8 @@
 package service
 
 import (
+	"fmt"
+
 	"novel-agent/internal/config"
 	"novel-agent/internal/service/agents"
 	llm2 "novel-agent/internal/service/llm"
@@ -31,21 +33,48 @@ type Service struct {
 }
 
 // NewService creates a new service container
-func NewService(cfg *config.Config) *Service {
+func NewService(cfg *config.Config) (*Service, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("service configuration is required")
+	}
+	validated := *cfg
+	if err := validated.Validate(); err != nil {
+		return nil, fmt.Errorf("service configuration is invalid: %w", err)
+	}
+	remoteLLM := validated.LLM.Provider == "modelscope" || validated.LLM.Provider == "openai"
+	if remoteLLM && !validated.LLMCredentialsLoadedFromFile() {
+		return nil, fmt.Errorf("service LLM credentials are not loaded from a key file")
+	}
+	embeddingUsesKeyFile := validated.Embedding.Provider == "modelscope" || validated.Embedding.APIKeyFile != ""
+	if embeddingUsesKeyFile && !validated.EmbeddingCredentialsLoadedFromFile() {
+		return nil, fmt.Errorf("service embedding credentials are not loaded from a key file")
+	}
+	if !embeddingUsesKeyFile {
+		validated.Embedding.APIKey = ""
+	}
+	cfg = &validated
 	// Create LLM client
-	llmClient := llm2.NewClient(
+	llmClient, err := llm2.NewClient(
 		cfg.LLM.Provider,
 		cfg.LLM.APIKey,
 		cfg.LLM.BaseURL,
 		cfg.LLM.Model,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create embedder client
-	embedder := llm2.NewEmbedderClient(
+	embedder, err := llm2.NewEmbedderClient(
 		cfg.Embedding.Provider,
 		cfg.Embedding.BaseURL,
 		cfg.Embedding.Model,
+		cfg.Embedding.APIKey,
+		cfg.Embedding.Dimension,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	writer := agents.NewWriter(llmClient)
 	critic := agents.NewCritic(llmClient)
@@ -76,5 +105,5 @@ func NewService(cfg *config.Config) *Service {
 		Context:      agents.NewContextBuilder(),
 		Orchestrator: orchestration.NewOrchestrator(writer, critic, reviser, validator, reader, dataAgent, scenePlanner, aigcDetector, styleAnalyzer),
 		Retrieval:    retrieval.NewRetrievalService(embedder, cfg.Embedding.Dimension),
-	}
+	}, nil
 }

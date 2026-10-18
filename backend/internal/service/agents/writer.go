@@ -31,8 +31,11 @@ func (w *Writer) WriteChapter(ctx context.Context, outline, styleGuide, memoryCo
 		return "", fmt.Errorf("failed to write chapter: %w", err)
 	}
 
-	// Post-process to clean up
+	// Post-process to clean up.
 	content = cleanChapterContent(content)
+	if err := validateGeneratedContent(content); err != nil {
+		return "", fmt.Errorf("invalid generated chapter: %w", err)
+	}
 
 	return content, nil
 }
@@ -105,6 +108,10 @@ func (w *Writer) ContinueChapter(ctx context.Context, existingContent, continuat
 	if err != nil {
 		return "", fmt.Errorf("failed to continue chapter: %w", err)
 	}
+	content = strings.TrimSpace(content)
+	if err := validateGeneratedContent(content); err != nil {
+		return "", fmt.Errorf("invalid chapter continuation: %w", err)
+	}
 
 	return content, nil
 }
@@ -128,6 +135,10 @@ func (w *Writer) RewriteChapter(ctx context.Context, existingContent, rewriteIns
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to rewrite chapter: %w", err)
+	}
+	content = strings.TrimSpace(content)
+	if err := validateGeneratedContent(content); err != nil {
+		return "", fmt.Errorf("invalid rewritten chapter: %w", err)
 	}
 
 	return content, nil
@@ -227,6 +238,13 @@ func requiredStringArray(result map[string]interface{}, key string) ([]string, e
 		items = append(items, strings.TrimSpace(item))
 	}
 	return items, nil
+}
+
+func validateGeneratedContent(content string) error {
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("generated content must not be empty")
+	}
+	return nil
 }
 
 // Helper function to clean chapter content

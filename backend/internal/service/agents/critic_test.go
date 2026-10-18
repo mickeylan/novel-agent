@@ -1,6 +1,9 @@
 package agents
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func validAuditMap() map[string]interface{} {
 	return map[string]interface{}{
@@ -13,6 +16,18 @@ func validAuditMap() map[string]interface{} {
 			"type": "风格", "severity": "WARNING", "description": "重复", "location": "第3段",
 		}},
 		"suggestions": []interface{}{" 精简重复表达 "},
+	}
+}
+
+func TestParseBulletedSuggestionsRequiresUsableItems(t *testing.T) {
+	items := parseBulletedSuggestions("- 第一条\n• 第二条\n· 第三条")
+	if len(items) != 3 || items[0] != "第一条" || items[1] != "第二条" || items[2] != "第三条" {
+		t.Fatalf("unexpected suggestions: %#v", items)
+	}
+	for _, content := range []string{"", "普通说明", "-   \n•"} {
+		if items := parseBulletedSuggestions(content); len(items) != 0 {
+			t.Fatalf("invalid suggestions were accepted: %#v", items)
+		}
 	}
 }
 
@@ -30,10 +45,15 @@ func TestParseAuditResultRejectsInvalidSchema(t *testing.T) {
 	tests := []func(map[string]interface{}){
 		func(value map[string]interface{}) { delete(value, "overall_score") },
 		func(value map[string]interface{}) { value["overall_score"] = 11.0 },
+		func(value map[string]interface{}) { value["overall_score"] = math.NaN() },
+		func(value map[string]interface{}) { value["overall_score"] = math.Inf(1) },
 		func(value map[string]interface{}) { value["summary"] = " " },
 		func(value map[string]interface{}) { value["dimensions"] = []interface{}{} },
 		func(value map[string]interface{}) {
 			value["dimensions"] = []interface{}{map[string]interface{}{"name": "情节", "score": -1.0, "feedback": "差"}}
+		},
+		func(value map[string]interface{}) {
+			value["dimensions"] = []interface{}{map[string]interface{}{"name": "情节", "score": math.NaN(), "feedback": "差"}}
 		},
 		func(value map[string]interface{}) { value["issues"] = "none" },
 		func(value map[string]interface{}) {

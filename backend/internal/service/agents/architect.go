@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"novel-agent/internal/service/llm"
@@ -257,7 +258,7 @@ func decodeChapterOutline(result map[string]interface{}, chapterNumber int) (*Ch
 		return nil, err
 	}
 	wordCount, ok := result["word_count_target"].(float64)
-	if !ok || wordCount != float64(int(wordCount)) || wordCount < 100 || wordCount > 20000 {
+	if !ok || math.IsNaN(wordCount) || math.IsInf(wordCount, 0) || wordCount != math.Trunc(wordCount) || wordCount < 100 || wordCount > 20000 {
 		return nil, fmt.Errorf("word_count_target must be an integer between 100 and 20000")
 	}
 	return &ChapterOutline{ChapterNumber: chapterNumber, Title: values["title"], Summary: values["summary"], KeyEvents: keyEvents, Setting: values["setting"], Conflict: values["conflict"], WordCountTarget: int(wordCount), OpeningType: values["opening_type"], CliffhangerType: values["cliffhanger_type"], ChapterType: values["chapter_type"], BeatOutline: beats, HookPlan: values["hook_plan"]}, nil

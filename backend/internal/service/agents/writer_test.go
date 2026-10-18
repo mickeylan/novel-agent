@@ -5,6 +5,24 @@ import (
 	"testing"
 )
 
+func TestValidateGeneratedContentRejectsWhitespace(t *testing.T) {
+	for _, content := range []string{"", "   ", "\n\t"} {
+		if err := validateGeneratedContent(content); err == nil {
+			t.Fatalf("whitespace generated content was accepted: %q", content)
+		}
+	}
+	if err := validateGeneratedContent("有效正文"); err != nil {
+		t.Fatalf("valid generated content rejected: %v", err)
+	}
+}
+
+func TestCleanChapterContentCannotSilentlyProduceEmptySuccess(t *testing.T) {
+	cleaned := cleanChapterContent("  \n\t  ")
+	if err := validateGeneratedContent(cleaned); err == nil {
+		t.Fatal("empty post-processed content was accepted")
+	}
+}
+
 func TestDecodeChapterSummaryValidatesRequiredSchema(t *testing.T) {
 	valid := map[string]interface{}{
 		"summary": "  本章摘要  ", "emotional_arc": " 紧张到释然 ",

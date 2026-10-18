@@ -221,7 +221,7 @@ type UpdateChapterRequest struct {
 	Title     *string   `json:"title"`
 	Outline   *string   `json:"outline"`
 	Content   *string   `json:"content"`
-	UpdatedAt time.Time `json:"updated_at" binding:"required"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type SearchRequest struct {

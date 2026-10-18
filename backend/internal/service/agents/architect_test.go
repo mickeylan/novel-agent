@@ -1,6 +1,9 @@
 package agents
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func validThreeActMap() map[string]interface{} {
 	return map[string]interface{}{
@@ -41,6 +44,8 @@ func TestDecodeChapterOutlineValidatesSchema(t *testing.T) {
 		func(value map[string]interface{}) { value["beat_outline"] = []interface{}{1} },
 		func(value map[string]interface{}) { value["word_count_target"] = 99.0 },
 		func(value map[string]interface{}) { value["word_count_target"] = 5000.5 },
+		func(value map[string]interface{}) { value["word_count_target"] = math.NaN() },
+		func(value map[string]interface{}) { value["word_count_target"] = math.Inf(1) },
 	}
 	for index, mutate := range tests {
 		value := validChapterOutlineMap()

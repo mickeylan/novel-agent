@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"novel-agent/internal/service/llm"
@@ -117,7 +118,7 @@ func (c *Critic) QuickAudit(ctx context.Context, chapterContent string) (float64
 	}
 
 	score, ok := result["score"].(float64)
-	if !ok || score < 0 || score > 10 {
+	if !ok || !finiteScore(score) || score < 0 || score > 10 {
 		return 0, nil, fmt.Errorf("invalid quick audit response: score must be between 0 and 10")
 	}
 	suggestions, err := requiredStringArray(result, "suggestions")
@@ -147,17 +148,26 @@ func (c *Critic) SuggestImprovements(ctx context.Context, chapterContent, auditR
 		return nil, fmt.Errorf("failed to generate improvements: %w", err)
 	}
 
-	// Parse suggestions into array
-	lines := strings.Split(suggestions, "\n")
+	result := parseBulletedSuggestions(suggestions)
+	if len(result) == 0 {
+		return nil, fmt.Errorf("invalid improvement response: no suggestions found")
+	}
+	return result, nil
+}
+
+func parseBulletedSuggestions(content string) []string {
 	var result []string
-	for _, line := range lines {
+	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" && (strings.HasPrefix(line, "-") || strings.HasPrefix(line, "•") || strings.HasPrefix(line, "·")) {
-			result = append(result, strings.TrimPrefix(strings.TrimPrefix(line, "-"), "•"))
+		if line == "" || (!strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "•") && !strings.HasPrefix(line, "·")) {
+			continue
+		}
+		item := strings.TrimSpace(strings.TrimLeft(line, "-•·"))
+		if item != "" {
+			result = append(result, item)
 		}
 	}
-
-	return result, nil
+	return result
 }
 
 // CheckContinuity checks for continuity errors with previous chapters
@@ -205,13 +215,20 @@ func (c *Critic) CheckContinuity(ctx context.Context, currentChapter, previousCh
 		}
 	}
 
+	if len(issues) == 0 {
+		return nil, fmt.Errorf("invalid continuity response: no result found")
+	}
 	return issues, nil
+}
+
+func finiteScore(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 // Helper function to parse audit result
 func parseAuditResult(m map[string]interface{}) (*AuditResult, error) {
 	score, ok := m["overall_score"].(float64)
-	if !ok || score < 0 || score > 10 {
+	if !ok || !finiteScore(score) || score < 0 || score > 10 {
 		return nil, fmt.Errorf("overall_score must be between 0 and 10")
 	}
 	summary, ok := m["summary"].(string)
@@ -230,7 +247,7 @@ func parseAuditResult(m map[string]interface{}) (*AuditResult, error) {
 		}
 		name, feedback := strings.TrimSpace(getStringValue(dimensionMap, "name")), strings.TrimSpace(getStringValue(dimensionMap, "feedback"))
 		dimensionScore, ok := dimensionMap["score"].(float64)
-		if name == "" || feedback == "" || !ok || dimensionScore < 0 || dimensionScore > 10 {
+		if name == "" || feedback == "" || !ok || !finiteScore(dimensionScore) || dimensionScore < 0 || dimensionScore > 10 {
 			return nil, fmt.Errorf("dimensions[%d] requires name, feedback, and score between 0 and 10", index)
 		}
 		result.Dimensions = append(result.Dimensions, Dimension{Name: name, Score: dimensionScore, Feedback: feedback})

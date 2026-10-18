@@ -3,8 +3,24 @@ package retrieval
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 )
+
+func TestSearchesRejectMissingDatabaseWithoutPanic(t *testing.T) {
+	service := NewRetrievalService(nil, 1024)
+	for name, search := range map[string]func() error{
+		"vector":  func() error { _, err := service.VectorSearch(context.Background(), "query", nil, 5); return err },
+		"hybrid":  func() error { _, err := service.HybridSearch(context.Background(), "query", nil, 5); return err },
+		"keyword": func() error { _, err := service.KeywordSearch(context.Background(), "query", nil, 5); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := search(); err == nil || err.Error() != "database is not initialized" {
+				t.Fatalf("unexpected missing database error: %v", err)
+			}
+		})
+	}
+}
 
 func TestSearchesRejectCanceledContextBeforeEmbeddingOrDatabaseAccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -20,6 +36,29 @@ func TestSearchesRejectCanceledContextBeforeEmbeddingOrDatabaseAccess(t *testing
 				t.Fatalf("search returned %v, want context.Canceled", err)
 			}
 		})
+	}
+}
+
+func TestParseMetadataRejectsCorruptOrNonObjectJSON(t *testing.T) {
+	for _, data := range [][]byte{[]byte(`{"broken":`), []byte(`[]`), []byte(`"text"`)} {
+		if value, err := parseMetadata(data); err == nil || value != nil {
+			t.Fatalf("invalid metadata accepted: data=%s value=%#v err=%v", data, value, err)
+		}
+	}
+	value, err := parseMetadata([]byte(`{"source":"book"}`))
+	if err != nil || value["source"] != "book" {
+		t.Fatalf("valid metadata rejected: value=%#v err=%v", value, err)
+	}
+}
+
+func TestValidateSearchSimilarityRejectsNonFiniteValues(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if err := validateSearchSimilarity(value); err == nil {
+			t.Fatalf("non-finite similarity accepted: %v", value)
+		}
+	}
+	if err := validateSearchSimilarity(0.75); err != nil {
+		t.Fatalf("finite similarity rejected: %v", err)
 	}
 }
 

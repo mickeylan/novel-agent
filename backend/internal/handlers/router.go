@@ -9,10 +9,12 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -22,6 +24,7 @@ import (
 
 const (
 	maxAPIRequestBodyBytes int64 = 1 << 20
+	maxChapterNumber             = 1000000
 	requestIDContextKey          = "request_id"
 	requestIDHeader              = "X-Request-ID"
 )
@@ -67,6 +70,22 @@ func safeAPIAccessLog() gin.HandlerFunc {
 			route = "unmatched"
 		}
 		log.Printf("[access] request_id=%s method=%s route=%s status=%d duration_ms=%d", requestIDFromContext(c), c.Request.Method, route, c.Writer.Status(), time.Since(started).Milliseconds())
+	}
+}
+
+func rejectAmbiguousSecurityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		for _, name := range []string{requestIDHeader, "Content-Type", "Content-Encoding"} {
+			if len(c.Request.Header.Values(name)) > 1 {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+					"error":      "request contains a repeated security-sensitive header",
+					"code":       "ambiguous_request_header",
+					"request_id": requestIDFromContext(c),
+				})
+				return
+			}
+		}
+		c.Next()
 	}
 }
 
@@ -126,7 +145,7 @@ func validateAPIPathParams() gin.HandlerFunc {
 		value := c.Param("chapter_number")
 		if value != "" {
 			chapterNumber, err := strconv.Atoi(value)
-			if err != nil || chapterNumber < 1 || chapterNumber > 1000000 {
+			if err != nil || !validChapterNumber(chapterNumber) {
 				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 					"error":      "chapter_number must be an integer between 1 and 1000000",
 					"code":       "invalid_chapter_number",
@@ -134,6 +153,73 @@ func validateAPIPathParams() gin.HandlerFunc {
 				})
 				return
 			}
+		}
+		c.Next()
+	}
+}
+
+func validChapterNumber(chapterNumber int) bool {
+	return chapterNumber >= 1 && chapterNumber <= maxChapterNumber
+}
+
+func validateAPIQueryParams() gin.HandlerFunc {
+	allowedByRoute := map[string]map[string]struct{}{
+		"/api/v1/projects/:project_id/export":                                   {"format": {}},
+		"/api/v1/projects/:project_id/chapters/:chapter_number/prompt":          {"target_word_count": {}},
+		"/api/v1/projects/:project_id/chapters/:chapter_number/context-preview": {"max_runes": {}},
+	}
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery == "" {
+			c.Next()
+			return
+		}
+		values, err := url.ParseQuery(c.Request.URL.RawQuery)
+		allowed := allowedByRoute[c.FullPath()]
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "query string is invalid",
+				"code":  "invalid_query_parameter",
+			})
+			return
+		}
+		for key, entries := range values {
+			if _, ok := allowed[key]; !ok || len(entries) != 1 {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+					"error": "query contains an unknown or repeated parameter",
+					"code":  "invalid_query_parameter",
+				})
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
+func rejectBodyOnReadMethods() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			c.Next()
+			return
+		}
+		if c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "GET and HEAD requests must not include a request body",
+				"code":  "unexpected_request_body",
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func rejectContentEncoding() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if strings.TrimSpace(c.GetHeader("Content-Encoding")) != "" {
+			c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{
+				"error": "Content-Encoding is not supported",
+				"code":  "unsupported_content_encoding",
+			})
+			return
 		}
 		c.Next()
 	}
@@ -147,8 +233,13 @@ func requireJSONContentType() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
-		if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		mediaType, parameters, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+		validParameters := len(parameters) == 0
+		if len(parameters) == 1 {
+			charset, exists := parameters["charset"]
+			validParameters = exists && strings.EqualFold(strings.TrimSpace(charset), "utf-8")
+		}
+		if err != nil || !strings.EqualFold(mediaType, "application/json") || !validParameters {
 			c.AbortWithStatusJSON(http.StatusUnsupportedMediaType, gin.H{
 				"error": "Content-Type must be application/json",
 				"code":  "unsupported_media_type",
@@ -204,14 +295,23 @@ func limitAPIRequestBody(maxBytes int64) gin.HandlerFunc {
 	}
 }
 
-const maxJSONNestingDepth = 64
+const (
+	maxJSONNestingDepth     = 64
+	maxJSONContainerEntries = 10000
+	maxJSONTotalValues      = 20000
+)
 
 var (
 	errDuplicateJSONKey = errors.New("duplicate JSON object key")
 	errJSONTooDeep      = errors.New("JSON nesting depth exceeded")
+	errJSONTooComplex   = errors.New("JSON structure complexity exceeded")
 )
 
-func rejectDuplicateJSONKeys(decoder *json.Decoder, depth int) error {
+type jsonComplexity struct {
+	totalValues int
+}
+
+func rejectDuplicateJSONKeys(decoder *json.Decoder, depth int, complexity *jsonComplexity) error {
 	if depth > maxJSONNestingDepth {
 		return errJSONTooDeep
 	}
@@ -226,7 +326,13 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder, depth int) error {
 	switch delimiter {
 	case '{':
 		seen := make(map[string]struct{})
+		entries := 0
 		for decoder.More() {
+			entries++
+			complexity.totalValues++
+			if entries > maxJSONContainerEntries || complexity.totalValues > maxJSONTotalValues {
+				return errJSONTooComplex
+			}
 			keyToken, err := decoder.Token()
 			if err != nil {
 				return err
@@ -239,15 +345,21 @@ func rejectDuplicateJSONKeys(decoder *json.Decoder, depth int) error {
 				return errDuplicateJSONKey
 			}
 			seen[key] = struct{}{}
-			if err := rejectDuplicateJSONKeys(decoder, depth+1); err != nil {
+			if err := rejectDuplicateJSONKeys(decoder, depth+1, complexity); err != nil {
 				return err
 			}
 		}
 		_, err = decoder.Token()
 		return err
 	case '[':
+		entries := 0
 		for decoder.More() {
-			if err := rejectDuplicateJSONKeys(decoder, depth+1); err != nil {
+			entries++
+			complexity.totalValues++
+			if entries > maxJSONContainerEntries || complexity.totalValues > maxJSONTotalValues {
+				return errJSONTooComplex
+			}
+			if err := rejectDuplicateJSONKeys(decoder, depth+1, complexity); err != nil {
 				return err
 			}
 		}
@@ -271,6 +383,10 @@ func validateSingleJSONObject() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "failed to read request body", "code": "invalid_request_body"})
 			return
 		}
+		if !utf8.Valid(body) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "request body must be valid UTF-8", "code": "invalid_utf8_body"})
+			return
+		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		decoder := json.NewDecoder(bytes.NewReader(body))
 		var value json.RawMessage
@@ -288,13 +404,15 @@ func validateSingleJSONObject() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "request body must contain exactly one JSON object", "code": "invalid_json_body"})
 			return
 		}
-		if err := rejectDuplicateJSONKeys(json.NewDecoder(bytes.NewReader(trimmed)), 1); err != nil {
+		if err := rejectDuplicateJSONKeys(json.NewDecoder(bytes.NewReader(trimmed)), 1, &jsonComplexity{}); err != nil {
 			code, message := "invalid_json_body", "request body contains invalid JSON"
 			switch {
 			case errors.Is(err, errDuplicateJSONKey):
 				code, message = "duplicate_json_key", "request body contains duplicate JSON object keys"
 			case errors.Is(err, errJSONTooDeep):
 				code, message = "json_nesting_too_deep", "request body exceeds the JSON nesting depth limit"
+			case errors.Is(err, errJSONTooComplex):
+				code, message = "json_structure_too_complex", "request body exceeds the JSON structure complexity limit"
 			}
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": message, "code": code})
 			return
@@ -356,7 +474,7 @@ func SetupRouter(svc *service.Service) *gin.Engine {
 	aiLimit := limitConcurrentAI(maxConcurrentAI)
 
 	api := r.Group("/api/v1")
-	api.Use(requestIDMiddleware(), apiSecurityHeaders(), safeAPIAccessLog(), recoverAPI(), validateAPIPathParams(), requireJSONContentType(), limitAPIRequestBody(maxAPIRequestBodyBytes), validateSingleJSONObject())
+	api.Use(requestIDMiddleware(), rejectAmbiguousSecurityHeaders(), apiSecurityHeaders(), safeAPIAccessLog(), recoverAPI(), validateAPIPathParams(), validateAPIQueryParams(), rejectBodyOnReadMethods(), rejectContentEncoding(), requireJSONContentType(), limitAPIRequestBody(maxAPIRequestBodyBytes), validateSingleJSONObject())
 	{
 		// Health and read-only schema compatibility checks
 		api.GET("/health", h.HealthCheck)

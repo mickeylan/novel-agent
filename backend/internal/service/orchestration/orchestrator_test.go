@@ -2,6 +2,9 @@ package orchestration
 
 import (
 	"context"
+	"errors"
+	"math"
+	"strings"
 	"testing"
 
 	"novel-agent/internal/service/agents"
@@ -49,6 +52,24 @@ func (fakeDataExtractor) ExtractPreview(_ context.Context, chapterNumber int, co
 	return &agents.DataExtractionPreview{StateChanges: []agents.StateChange{{EntityName: "林舟", Field: "状态", NewValue: content, Evidence: "正文", Confidence: 0.9}}, Preview: true}, nil
 }
 
+type nilDataExtractor struct{}
+
+func (nilDataExtractor) ExtractPreview(context.Context, int, string, string) (*agents.DataExtractionPreview, error) {
+	return nil, nil
+}
+
+type failingDataExtractor struct{ detail string }
+
+func (f failingDataExtractor) ExtractPreview(context.Context, int, string, string) (*agents.DataExtractionPreview, error) {
+	return nil, errors.New(f.detail)
+}
+
+type nilReviser struct{}
+
+func (nilReviser) Revise(context.Context, string, []agents.RevisionIssue, float64) (*agents.RevisionPreview, error) {
+	return nil, nil
+}
+
 type fakeReviser struct{ candidate string }
 
 func (f fakeReviser) Revise(context.Context, string, []agents.RevisionIssue, float64) (*agents.RevisionPreview, error) {
@@ -67,6 +88,28 @@ func TestPreviewChapterRevisesOnceBelowThreshold(t *testing.T) {
 	}
 	if len(result.Steps) != 9 || !hasStep(result.Steps, "final_validate") || !hasStep(result.Steps, "final_reader_analysis") || !hasStep(result.Steps, "quality_gate") {
 		t.Fatalf("expected revision and final quality steps: %#v", result.Steps)
+	}
+}
+
+func TestPreviewChapterRejectsInvalidDownstreamResults(t *testing.T) {
+	tests := []struct {
+		name       string
+		writer     Writer
+		critic     Critic
+		reviser    Reviser
+		autoRevise bool
+	}{
+		{name: "blank writer", writer: fakeWriter{content: "  \n"}, critic: &fakeCritic{scores: []float64{8}}, reviser: fakeReviser{}},
+		{name: "non-finite audit", writer: fakeWriter{content: "正文"}, critic: &fakeCritic{scores: []float64{math.NaN()}}, reviser: fakeReviser{}},
+		{name: "nil revision", writer: fakeWriter{content: "正文"}, critic: &fakeCritic{scores: []float64{5}}, reviser: nilReviser{}, autoRevise: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			orchestrator := NewOrchestrator(test.writer, test.critic, test.reviser, agents.NewContinuityValidator(), agents.NewReaderPerspectiveAnalyzer(), nil, nil, nil, nil)
+			if _, err := orchestrator.PreviewChapter(context.Background(), PreviewRequest{Outline: "大纲", TargetWordCount: 1000, AutoRevise: test.autoRevise, RevisionThreshold: 6}); err == nil {
+				t.Fatal("invalid downstream result was accepted")
+			}
+		})
 	}
 }
 
@@ -95,6 +138,39 @@ func TestPreviewChapterOptionallyExtractsDataChanges(t *testing.T) {
 	}
 	if result.Steps[len(result.Steps)-1].Name != "data_extract" {
 		t.Fatalf("expected data_extract step: %#v", result.Steps)
+	}
+}
+
+func TestPreviewChapterMarksNilAdvisoryExtractionAsFailure(t *testing.T) {
+	critic := &fakeCritic{scores: []float64{8.0}}
+	orchestrator := NewOrchestrator(fakeWriter{content: "候选正文"}, critic, fakeReviser{}, agents.NewContinuityValidator(), agents.NewReaderPerspectiveAnalyzer(), nilDataExtractor{}, nil, nil, nil)
+	result, err := orchestrator.PreviewChapter(context.Background(), PreviewRequest{Outline: "大纲", TargetWordCount: 1000, ChapterNumber: 3, ExtractDataChanges: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := result.Steps[len(result.Steps)-1]
+	if result.DataChanges != nil || len(result.Errors) != 1 || result.Errors[0] != "data_extract_failed" || step.Status != "failed" || step.Error != "step_failed" {
+		t.Fatalf("unexpected nil extraction handling: result=%#v step=%#v", result, step)
+	}
+}
+
+func TestPreviewChapterRedactsAdvisoryDataExtractionFailure(t *testing.T) {
+	const secretDetail = "provider response contained unpublished chapter text"
+	critic := &fakeCritic{scores: []float64{8.0}}
+	orchestrator := NewOrchestrator(fakeWriter{content: "候选正文"}, critic, fakeReviser{}, agents.NewContinuityValidator(), agents.NewReaderPerspectiveAnalyzer(), failingDataExtractor{detail: secretDetail}, nil, nil, nil)
+	result, err := orchestrator.PreviewChapter(context.Background(), PreviewRequest{Outline: "大纲", TargetWordCount: 1000, ChapterNumber: 3, ExtractDataChanges: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidate != "候选正文" || len(result.Errors) != 1 || result.Errors[0] != "data_extract_failed" {
+		t.Fatalf("unexpected advisory failure result: %#v", result)
+	}
+	step := result.Steps[len(result.Steps)-1]
+	if step.Name != "data_extract" || step.Status != "failed" || step.Error != "step_failed" {
+		t.Fatalf("unexpected failed step: %#v", step)
+	}
+	if strings.Contains(strings.Join(result.Errors, " ")+step.Error, secretDetail) {
+		t.Fatal("advisory error leaked internal detail")
 	}
 }
 
@@ -154,6 +230,17 @@ func TestEstimateOutputTokenBudgetUsesWorstCaseOptionalSteps(t *testing.T) {
 	}
 	if got := EstimateOutputTokenBudget(5000, true, true); got != 32000 {
 		t.Fatalf("full budget = %d, want 32000", got)
+	}
+}
+
+func TestPreviewChapterRejectsNonFiniteRevisionThresholdBeforeWriter(t *testing.T) {
+	for _, threshold := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		writer := &recordingWriter{content: "不应生成"}
+		orchestrator := NewOrchestrator(writer, &fakeCritic{scores: []float64{8}}, fakeReviser{}, agents.NewContinuityValidator(), agents.NewReaderPerspectiveAnalyzer(), nil, nil, nil, nil)
+		_, err := orchestrator.PreviewChapter(context.Background(), PreviewRequest{Outline: "大纲", TargetWordCount: 1000, RevisionThreshold: threshold})
+		if err == nil || writer.called {
+			t.Fatalf("expected non-finite threshold rejection for %v, got %v", threshold, err)
+		}
 	}
 }
 

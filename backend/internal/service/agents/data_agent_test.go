@@ -1,15 +1,26 @@
 package agents
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
+
+func TestNormalizeConfidenceRejectsNonFiniteValues(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if normalized := normalizeConfidence(value); normalized != 0 || math.IsNaN(normalized) || math.IsInf(normalized, 0) {
+			t.Fatalf("non-finite confidence was not safely normalized: %v", normalized)
+		}
+	}
+}
 
 func TestNormalizeExtractionDropsUnsupportedCandidatesAndClampsConfidence(t *testing.T) {
 	preview := &DataExtractionPreview{
 		StateChanges: []StateChange{
-			{EntityName: " 林舟 ", Field: " 状态 ", NewValue: " 受伤 ", Evidence: " 手臂流血 ", Confidence: 1.5},
+			{EntityType: " CHARACTER ", EntityName: " 林舟 ", Field: " 状态 ", NewValue: " 受伤 ", Evidence: " 手臂流血 ", Confidence: 1.5},
 			{EntityName: "无证据", Field: "状态", NewValue: "未知"},
 		},
-		NewEntities: []NewEntity{{Name: " 苏月 ", Evidence: " 苏月推门而入 ", Confidence: -1}},
-		Hooks:       []HookCandidate{{Description: "神秘玉佩发光", Evidence: "玉佩忽然亮起", Confidence: 0.8}},
+		NewEntities: []NewEntity{{EntityType: "character", Name: " 苏月 ", Description: " 新角色 ", Evidence: " 苏月推门而入 ", Confidence: -1}},
+		Hooks:       []HookCandidate{{HookType: "mystery", Priority: "high", Description: "神秘玉佩发光", Evidence: "玉佩忽然亮起", Confidence: 0.8}},
 	}
 	normalizeExtraction(preview)
 	if len(preview.StateChanges) != 1 || preview.StateChanges[0].Confidence != 1 {
@@ -20,6 +31,25 @@ func TestNormalizeExtractionDropsUnsupportedCandidatesAndClampsConfidence(t *tes
 	}
 	if len(preview.Hooks) != 1 {
 		t.Fatalf("expected one hook")
+	}
+}
+
+func TestNormalizeExtractionFiltersInvalidEnumsAndTrimsNestedValues(t *testing.T) {
+	chapter := -1
+	preview := &DataExtractionPreview{
+		StateChanges: []StateChange{{EntityType: "unknown", EntityName: "角色", Field: "状态", NewValue: "变化", Evidence: "证据"}},
+		NewEntities:  []NewEntity{{EntityType: " location ", Name: " 地点 ", Description: " 描述 ", Attributes: map[string]string{" 颜色 ": " 红色 ", "空": " "}, Evidence: " 证据 "}},
+		Hooks: []HookCandidate{
+			{HookType: " mystery ", Priority: " HIGH ", Description: " 谜团 ", RelatedCharacters: []string{" 林舟 ", " "}, Evidence: " 证据 "},
+			{HookType: "mystery", Priority: "high", Description: "错误章节", ExpectedResolutionChapter: &chapter, Evidence: "证据"},
+		},
+	}
+	normalizeExtraction(preview)
+	if len(preview.StateChanges) != 0 || len(preview.NewEntities) != 1 || len(preview.Hooks) != 1 {
+		t.Fatalf("unexpected filtered preview: %#v", preview)
+	}
+	if preview.NewEntities[0].Attributes["颜色"] != "红色" || len(preview.NewEntities[0].Attributes) != 1 || len(preview.Hooks[0].RelatedCharacters) != 1 || preview.Hooks[0].Priority != "high" {
+		t.Fatalf("nested values were not normalized: %#v", preview)
 	}
 }
 

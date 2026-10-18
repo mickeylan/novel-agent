@@ -3,6 +3,9 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -10,6 +13,21 @@ import (
 	"novel-agent/internal/models"
 	"novel-agent/pkg/database"
 )
+
+func requireDatabase() error {
+	if !database.IsInitialized() {
+		return fmt.Errorf("database is not initialized")
+	}
+	return nil
+}
+
+func copyUpdates(updates map[string]interface{}) map[string]interface{} {
+	copied := make(map[string]interface{}, len(updates)+1)
+	for key, value := range updates {
+		copied[key] = value
+	}
+	return copied
+}
 
 type ProjectRepository struct{}
 
@@ -21,12 +39,18 @@ func (r *ProjectRepository) Create(ctx context.Context, project *models.StoryPro
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := requireDatabase(); err != nil {
+		return "", err
+	}
 	result := database.DB.WithContext(ctx).Create(project)
 	return project.ID, result.Error
 }
 
 func (r *ProjectRepository) GetByID(ctx context.Context, projectID string) (*models.StoryProject, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := requireDatabase(); err != nil {
 		return nil, err
 	}
 	var project models.StoryProject
@@ -41,6 +65,9 @@ func (r *ProjectRepository) ListAll(ctx context.Context) ([]models.StoryProject,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := requireDatabase(); err != nil {
+		return nil, err
+	}
 	var projects []models.StoryProject
 	result := database.DB.WithContext(ctx).Order("created_at DESC").Find(&projects)
 	return projects, result.Error
@@ -50,10 +77,14 @@ func (r *ProjectRepository) UpdateIfUnchanged(ctx context.Context, projectID str
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	if err := requireDatabase(); err != nil {
+		return 0, err
+	}
+	databaseUpdates := copyUpdates(updates)
+	databaseUpdates["updated_at"] = gorm.Expr("clock_timestamp()")
 	result := database.DB.WithContext(ctx).Model(&models.StoryProject{}).
 		Where("id = ? AND updated_at = ?", projectID, expectedUpdatedAt).
-		Updates(updates)
+		Updates(databaseUpdates)
 	return result.RowsAffected, result.Error
 }
 
@@ -69,12 +100,18 @@ func (r *ChapterRepository) Create(ctx context.Context, chapter *models.Chapter)
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := requireDatabase(); err != nil {
+		return "", err
+	}
 	result := database.DB.WithContext(ctx).Create(chapter)
 	return chapter.ID, result.Error
 }
 
 func (r *ChapterRepository) GetByID(ctx context.Context, chapterID string) (*models.Chapter, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := requireDatabase(); err != nil {
 		return nil, err
 	}
 	var chapter models.Chapter
@@ -89,6 +126,9 @@ func (r *ChapterRepository) GetByNumber(ctx context.Context, projectID string, c
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := requireDatabase(); err != nil {
+		return nil, err
+	}
 	var chapter models.Chapter
 	result := database.DB.WithContext(ctx).Where("project_id = ? AND chapter_number = ?", projectID, chapterNumber).First(&chapter)
 	if result.Error != nil {
@@ -101,6 +141,9 @@ func (r *ChapterRepository) GetByProject(ctx context.Context, projectID string) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := requireDatabase(); err != nil {
+		return nil, err
+	}
 	var chapters []models.Chapter
 	result := database.DB.WithContext(ctx).Where("project_id = ?", projectID).Order("chapter_number ASC").Find(&chapters)
 	return chapters, result.Error
@@ -110,10 +153,14 @@ func (r *ChapterRepository) UpdateIfUnchanged(ctx context.Context, projectID str
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	if err := requireDatabase(); err != nil {
+		return 0, err
+	}
+	databaseUpdates := copyUpdates(updates)
+	databaseUpdates["updated_at"] = gorm.Expr("clock_timestamp()")
 	result := database.DB.WithContext(ctx).Model(&models.Chapter{}).
 		Where("project_id = ? AND chapter_number = ? AND updated_at = ?", projectID, chapterNumber, expectedUpdatedAt).
-		Updates(updates)
+		Updates(databaseUpdates)
 	return result.RowsAffected, result.Error
 }
 
@@ -129,8 +176,14 @@ func (r *CharacterRepository) Create(ctx context.Context, character *models.Char
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := requireDatabase(); err != nil {
+		return "", err
+	}
 	if character.Relationships != nil {
-		data, _ := json.Marshal(character.Relationships)
+		if !json.Valid(character.Relationships) {
+			return "", fmt.Errorf("character relationships must be valid JSON")
+		}
+		data := append(json.RawMessage(nil), character.Relationships...)
 		character.Relationships = data
 	}
 	result := database.DB.WithContext(ctx).Create(character)
@@ -139,6 +192,9 @@ func (r *CharacterRepository) Create(ctx context.Context, character *models.Char
 
 func (r *CharacterRepository) GetByID(ctx context.Context, characterID string) (*models.Character, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := requireDatabase(); err != nil {
 		return nil, err
 	}
 	var character models.Character
@@ -153,6 +209,9 @@ func (r *CharacterRepository) GetByProject(ctx context.Context, projectID string
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := requireDatabase(); err != nil {
+		return nil, err
+	}
 	var characters []models.Character
 	result := database.DB.WithContext(ctx).Where("project_id = ?", projectID).Order("name ASC").Find(&characters)
 	return characters, result.Error
@@ -162,20 +221,40 @@ func (r *CharacterRepository) UpdateIfUnchanged(ctx context.Context, projectID, 
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if rel, ok := updates["relationships"]; ok {
-		if relMap, ok := rel.(map[string]string); ok {
-			data, _ := json.Marshal(relMap)
-			updates["relationships"] = data
-		}
+	if err := requireDatabase(); err != nil {
+		return 0, err
 	}
-	updates["updated_at"] = gorm.Expr("clock_timestamp()")
+	databaseUpdates := copyUpdates(updates)
+	if rel, ok := databaseUpdates["relationships"]; ok {
+		relMap, ok := rel.(map[string]string)
+		if !ok {
+			return 0, fmt.Errorf("character relationships update has invalid type")
+		}
+		data, err := json.Marshal(relMap)
+		if err != nil {
+			return 0, fmt.Errorf("character relationships could not be encoded")
+		}
+		databaseUpdates["relationships"] = data
+	}
+	databaseUpdates["updated_at"] = gorm.Expr("clock_timestamp()")
 	result := database.DB.WithContext(ctx).Model(&models.Character{}).
 		Where("project_id = ? AND id = ? AND updated_at = ?", projectID, characterID, expectedUpdatedAt).
-		Updates(updates)
+		Updates(databaseUpdates)
 	return result.RowsAffected, result.Error
 }
 
 // ========== BookChunk Repository ==========
+
+func validateStoredSearchResult(similarity float64, metadata []byte) error {
+	if math.IsNaN(similarity) || math.IsInf(similarity, 0) {
+		return fmt.Errorf("search result similarity is not finite")
+	}
+	text := strings.TrimSpace(string(metadata))
+	if text != "" && text != "null" && (!json.Valid(metadata) || !strings.HasPrefix(text, "{")) {
+		return fmt.Errorf("search result metadata is not a JSON object")
+	}
+	return nil
+}
 
 type BookChunkRepository struct{}
 
@@ -185,6 +264,9 @@ func NewBookChunkRepository() *BookChunkRepository {
 
 func (r *BookChunkRepository) SearchSimilar(ctx context.Context, queryEmbedding []float32, filterGenre []string, limit int) ([]models.SearchResult, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := requireDatabase(); err != nil {
 		return nil, err
 	}
 	var results []models.SearchResult
@@ -216,12 +298,18 @@ func (r *BookChunkRepository) SearchSimilar(ctx context.Context, queryEmbedding 
 		if err := rows.Scan(&sr.ChunkID, &sr.Content, &sr.BookTitle, &sr.BookID, &sr.Similarity, &metadata); err != nil {
 			return nil, err
 		}
+		if err := validateStoredSearchResult(sr.Similarity, metadata); err != nil {
+			return nil, err
+		}
 		sr.Metadata = metadata
 		results = append(results, sr)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close search result rows: %w", err)
 	}
 	return results, nil
 }

@@ -8,6 +8,14 @@ import (
 	"novel-agent/internal/service/llm"
 )
 
+func validateEditorResult(result string) (string, error) {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "", fmt.Errorf("editor result must not be empty")
+	}
+	return result, nil
+}
+
 // Editor Agent - Style polishing and consistency checking
 type Editor struct {
 	client *llm.Client
@@ -35,7 +43,7 @@ func (e *Editor) PolishChapter(ctx context.Context, chapterContent, styleGuide s
 %s
 
 请直接输出润色后的内容，不需要说明修改了什么。`, styleGuide, chapterContent)
-	
+
 	result, err := e.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.6),
 		llm.WithMaxTokens(20000),
@@ -45,7 +53,7 @@ func (e *Editor) PolishChapter(ctx context.Context, chapterContent, styleGuide s
 		return "", fmt.Errorf("failed to polish chapter: %w", err)
 	}
 
-	return strings.TrimSpace(result), nil
+	return validateEditorResult(result)
 }
 
 // HumanizeContent removes AI flavor from content
@@ -63,7 +71,7 @@ func (e *Editor) HumanizeContent(ctx context.Context, content string) (string, e
 5. 保持原文的长度
 
 请直接输出改写后的内容。`, content)
-	
+
 	result, err := e.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.7),
 		llm.WithMaxTokens(20000),
@@ -73,7 +81,7 @@ func (e *Editor) HumanizeContent(ctx context.Context, content string) (string, e
 		return "", fmt.Errorf("failed to humanize content: %w", err)
 	}
 
-	return strings.TrimSpace(result), nil
+	return validateEditorResult(result)
 }
 
 // CheckForbiddenPatterns checks for forbidden writing patterns
@@ -108,7 +116,7 @@ func (e *Editor) FixConsistencyIssues(ctx context.Context, content, issues strin
 %s
 
 请直接输出修复后的内容，保持故事的流畅性。`, issues, content)
-	
+
 	result, err := e.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.5),
 		llm.WithMaxTokens(20000),
@@ -118,7 +126,7 @@ func (e *Editor) FixConsistencyIssues(ctx context.Context, content, issues strin
 		return "", fmt.Errorf("failed to fix consistency: %w", err)
 	}
 
-	return strings.TrimSpace(result), nil
+	return validateEditorResult(result)
 }
 
 // EnhanceDialogue enhances dialogue to be more natural
@@ -136,7 +144,7 @@ func (e *Editor) EnhanceDialogue(ctx context.Context, content string) (string, e
 5. 加入适当的面部表情和肢体语言描写
 
 请直接输出优化后的内容。`, content)
-	
+
 	result, err := e.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.6),
 		llm.WithMaxTokens(20000),
@@ -146,7 +154,7 @@ func (e *Editor) EnhanceDialogue(ctx context.Context, content string) (string, e
 		return "", fmt.Errorf("failed to enhance dialogue: %w", err)
 	}
 
-	return strings.TrimSpace(result), nil
+	return validateEditorResult(result)
 }
 
 // EnhanceDescription enhances scene and action descriptions
@@ -164,7 +172,7 @@ func (e *Editor) EnhanceDescription(ctx context.Context, content string) (string
 5. 与情节紧密结合
 
 请直接输出增强后的内容。`, content)
-	
+
 	result, err := e.client.Generate(ctx, prompt,
 		llm.WithTemperature(0.6),
 		llm.WithMaxTokens(20000),
@@ -174,5 +182,5 @@ func (e *Editor) EnhanceDescription(ctx context.Context, content string) (string
 		return "", fmt.Errorf("failed to enhance description: %w", err)
 	}
 
-	return strings.TrimSpace(result), nil
+	return validateEditorResult(result)
 }

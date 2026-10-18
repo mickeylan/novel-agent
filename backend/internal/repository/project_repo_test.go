@@ -7,7 +7,48 @@ import (
 	"time"
 
 	"novel-agent/internal/models"
+	"novel-agent/pkg/database"
 )
+
+func TestCopyUpdatesDoesNotAliasCallerMap(t *testing.T) {
+	originalRelationships := map[string]string{"ally": "trusted"}
+	original := map[string]interface{}{"title": "original", "relationships": originalRelationships}
+	copied := copyUpdates(original)
+	copied["title"] = "changed"
+	copied["updated_at"] = "generated"
+	copied["relationships"] = []byte(`{"ally":"trusted"}`)
+	if original["title"] != "original" {
+		t.Fatalf("copy mutation changed caller title: %#v", original)
+	}
+	if _, exists := original["updated_at"]; exists {
+		t.Fatal("copy mutation added generated field to caller map")
+	}
+	relationships, ok := original["relationships"].(map[string]string)
+	if !ok || relationships["ally"] != "trusted" {
+		t.Fatalf("copy mutation replaced caller relationships: %#v", original)
+	}
+	if copiedNil := copyUpdates(nil); copiedNil == nil {
+		t.Fatal("copyUpdates(nil) returned nil map")
+	}
+}
+
+func TestProjectRepositoryRejectsMissingDatabaseWithoutMutatingUpdates(t *testing.T) {
+	originalDB := database.DB
+	database.DB = nil
+	t.Cleanup(func() { database.DB = originalDB })
+
+	repo := NewProjectRepository()
+	if _, err := repo.GetByID(context.Background(), "project-id"); err == nil || err.Error() != "database is not initialized" {
+		t.Fatalf("unexpected missing database error: %v", err)
+	}
+	updates := map[string]interface{}{"title": "unchanged"}
+	if _, err := repo.UpdateIfUnchanged(context.Background(), "project-id", time.Now(), updates); err == nil || err.Error() != "database is not initialized" {
+		t.Fatalf("unexpected missing database update error: %v", err)
+	}
+	if _, exists := updates["updated_at"]; exists {
+		t.Fatal("missing database update mutated the update map")
+	}
+}
 
 func TestProjectRepositoryRejectsCanceledContextBeforeDatabaseAccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

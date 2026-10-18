@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"novel-agent/internal/service/llm"
@@ -34,6 +35,12 @@ func NewRetrievalService(embedder *llm.EmbedderClient, expectedDimension int) *R
 func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filterGenres []string, limit int) ([]SearchResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !database.IsInitialized() {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+	if s == nil || s.embedder == nil {
+		return nil, fmt.Errorf("embedding service is not configured")
 	}
 	// Generate query embedding
 	queryEmbedding, err := s.embedder.Encode(ctx, query)
@@ -79,8 +86,14 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
+		if err := validateSearchSimilarity(sr.Similarity); err != nil {
+			return nil, err
+		}
 		if len(metadata) > 0 {
-			sr.Metadata = parseMetadata(metadata)
+			sr.Metadata, err = parseMetadata(metadata)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		results = append(results, sr)
@@ -89,6 +102,9 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate search results: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close search results: %w", err)
+	}
 	return results, nil
 }
 
@@ -96,6 +112,12 @@ func (s *RetrievalService) VectorSearch(ctx context.Context, query string, filte
 func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, filterGenres []string, limit int) ([]SearchResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !database.IsInitialized() {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+	if s == nil || s.embedder == nil {
+		return nil, fmt.Errorf("embedding service is not configured")
 	}
 	// Generate embedding
 	queryEmbedding, err := s.embedder.Encode(ctx, queryText)
@@ -144,8 +166,14 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
+		if err := validateSearchSimilarity(sr.Similarity); err != nil {
+			return nil, err
+		}
 		if len(metadata) > 0 {
-			sr.Metadata = parseMetadata(metadata)
+			sr.Metadata, err = parseMetadata(metadata)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		results = append(results, sr)
@@ -154,6 +182,9 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate hybrid search results: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close hybrid search results: %w", err)
+	}
 	return results, nil
 }
 
@@ -161,6 +192,9 @@ func (s *RetrievalService) HybridSearch(ctx context.Context, queryText string, f
 func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filterGenres []string, limit int) ([]SearchResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !database.IsInitialized() {
+		return nil, fmt.Errorf("database is not initialized")
 	}
 	filterGenres = normalizeGenres(filterGenres)
 	sql := `
@@ -197,8 +231,14 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
+		if err := validateSearchSimilarity(sr.Similarity); err != nil {
+			return nil, err
+		}
 		if len(metadata) > 0 {
-			sr.Metadata = parseMetadata(metadata)
+			sr.Metadata, err = parseMetadata(metadata)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		results = append(results, sr)
@@ -206,6 +246,9 @@ func (s *RetrievalService) KeywordSearch(ctx context.Context, query string, filt
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate keyword search results: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close keyword search results: %w", err)
 	}
 	return results, nil
 }
@@ -280,8 +323,20 @@ func vectorToString(v []float32) string {
 	return sb.String()
 }
 
-func parseMetadata(data []byte) map[string]interface{} {
+func parseMetadata(data []byte) (map[string]interface{}, error) {
+	if len(data) == 0 || strings.TrimSpace(string(data)) == "null" {
+		return nil, nil
+	}
 	var result map[string]interface{}
-	json.Unmarshal(data, &result)
-	return result
+	if err := json.Unmarshal(data, &result); err != nil || result == nil {
+		return nil, fmt.Errorf("search result metadata is not a JSON object")
+	}
+	return result, nil
+}
+
+func validateSearchSimilarity(value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("search result similarity is not finite")
+	}
+	return nil
 }

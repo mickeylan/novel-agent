@@ -36,6 +36,7 @@ vector:
 
 embedding:
   provider: "openai"
+  api_key_file: ""  # 远程 Embedding 可指定独立密钥文件；当前本地端点无需密钥
   base_url: "http://10.0.0.200:8081"
   model: "bge-m3-Q4_K_M.gguf"
   dimension: 1024

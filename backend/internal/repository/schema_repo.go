@@ -57,7 +57,7 @@ func (r *SchemaRepository) Inspect(ctx context.Context) (*SchemaCompatibilityRep
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if database.DB == nil {
+	if !database.IsInitialized() {
 		return nil, fmt.Errorf("database not initialized")
 	}
 	const query = `
@@ -92,6 +92,9 @@ ORDER BY c.relname, a.attnum`
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate schema metadata: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close schema metadata rows: %w", err)
 	}
 	return BuildSchemaCompatibilityReport(columns), nil
 }

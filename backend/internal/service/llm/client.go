@@ -9,13 +9,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -28,15 +31,11 @@ type Provider interface {
 
 type ProviderHTTPError struct {
 	StatusCode int
-	Body       string
 	RetryAfter time.Duration
 }
 
 func (e *ProviderHTTPError) Error() string {
-	if e.Body == "" {
-		return fmt.Sprintf("API error: %d", e.StatusCode)
-	}
-	return fmt.Sprintf("API error: %d - %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("provider HTTP error: status %d", e.StatusCode)
 }
 
 type Option func(*Options)
@@ -82,6 +81,8 @@ func DefaultOptions() *Options {
 const (
 	maxLLMOutputTokens  = 40000
 	maxLLMTimeoutSecond = 1200
+	maxLLMRetries       = 5
+	maxLLMRetryBackoff  = 30 * time.Second
 )
 
 func resolveOptions(opts ...Option) (*Options, error) {
@@ -113,6 +114,61 @@ func withRequestTimeout(ctx context.Context, timeoutSeconds int) (context.Contex
 	return context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 }
 
+func validateProviderBaseURL(baseURL string) error {
+	value := strings.TrimSpace(baseURL)
+	if value == "" || len(value) > 2048 {
+		return fmt.Errorf("provider endpoint is invalid")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("provider endpoint is invalid")
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return fmt.Errorf("provider endpoint is invalid")
+	}
+	return nil
+}
+
+func validateProviderIdentity(model, apiKey string) error {
+	if strings.TrimSpace(model) == "" || len(model) > 512 || !utf8.ValidString(model) {
+		return fmt.Errorf("provider model is invalid")
+	}
+	for _, character := range model {
+		if unicode.IsControl(character) || unicode.Is(unicode.Cf, character) || (unicode.IsSpace(character) && character != ' ') {
+			return fmt.Errorf("provider model is invalid")
+		}
+	}
+	if apiKey == "" {
+		return nil
+	}
+	if len(apiKey) > 16<<10 || !utf8.ValidString(apiKey) {
+		return fmt.Errorf("provider credential is invalid")
+	}
+	for _, character := range apiKey {
+		if unicode.IsSpace(character) || unicode.IsControl(character) || unicode.Is(unicode.Cf, character) {
+			return fmt.Errorf("provider credential is invalid")
+		}
+	}
+	return nil
+}
+
+func validateProviderTransport(baseURL, apiKey string) error {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Host == "" {
+		return fmt.Errorf("provider endpoint is invalid")
+	}
+	if strings.EqualFold(parsed.Scheme, "https") {
+		return nil
+	}
+	if strings.TrimSpace(apiKey) != "" {
+		return fmt.Errorf("provider credentials require an HTTPS endpoint")
+	}
+	if !isLocalProviderEndpoint(baseURL) {
+		return fmt.Errorf("plaintext provider endpoint must be local")
+	}
+	return nil
+}
+
 func openAIEndpoint(baseURL, endpoint string) string {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	endpoint = strings.TrimLeft(endpoint, "/")
@@ -124,6 +180,13 @@ func openAIEndpoint(baseURL, endpoint string) string {
 
 func newProviderHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Provider traffic may contain unpublished text and credentials. Do not let
+	// ambient process proxy variables silently change its destination or expose
+	// plaintext local-provider requests. Proxying must be an explicit future feature.
+	transport.Proxy = nil
+	// Keep response limits tied to bytes supplied by the Provider. Automatic gzip
+	// negotiation hides the original encoding and changes the byte stream before validation.
+	transport.DisableCompression = true
 	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ResponseHeaderTimeout = time.Duration(maxLLMTimeoutSecond) * time.Second
@@ -131,7 +194,14 @@ func newProviderHTTPClient() *http.Client {
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 10
-	return &http.Client{Transport: transport}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			// Never forward unpublished text, prompts, embedding inputs or bearer
+			// credentials to a redirect target chosen by a Provider response.
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // ========== ModelScope Client ==========
@@ -153,6 +223,21 @@ func NewModelScopeClient(apiKey, baseURL, model string) *ModelScopeClient {
 }
 
 func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := validatePrompt(prompt); err != nil {
+		return "", err
+	}
+	if err := validateProviderBaseURL(c.BaseURL); err != nil {
+		return "", err
+	}
+	if err := validateProviderIdentity(c.Model, c.APIKey); err != nil {
+		return "", err
+	}
+	if err := validateProviderTransport(c.BaseURL, c.APIKey); err != nil {
+		return "", err
+	}
 	options, err := resolveOptions(opts...)
 	if err != nil {
 		return "", err
@@ -175,7 +260,10 @@ func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...
 		"stream":      useStream,
 	}
 
-	jsonData, _ := json.Marshal(reqBody)
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode provider request")
+	}
 	url := openAIEndpoint(c.BaseURL, "chat/completions")
 
 	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
@@ -194,27 +282,38 @@ func (c *ModelScopeClient) Generate(ctx context.Context, prompt string, opts ...
 	if resp.StatusCode != http.StatusOK {
 		return "", providerHTTPError(resp)
 	}
+	if err := validateProviderContentType(resp, useStream); err != nil {
+		return "", err
+	}
 
 	if useStream {
 		return c.handleStreamResponse(resp)
 	}
 
-	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	body, err := readBoundedUTF8Response(resp.Body, maxLLMResponseBytes)
 	if err != nil {
 		return "", err
 	}
 	var result struct {
 		Choices []struct {
-			Message struct{ Content string } `json:"message"`
+			Message      struct{ Content string } `json:"message"`
+			FinishReason string                   `json:"finish_reason"`
+			Index        *int                     `json:"index"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := unmarshalProviderJSON(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no response")
+	if len(result.Choices) != 1 {
+		return "", fmt.Errorf("provider response must contain exactly one choice")
 	}
-	return result.Choices[0].Message.Content, nil
+	if err := validateSingleChoice(len(result.Choices), result.Choices[0].Index); err != nil {
+		return "", err
+	}
+	if err := validateFinishReason(result.Choices[0].FinishReason); err != nil {
+		return "", err
+	}
+	return requireProviderText(result.Choices[0].Message.Content)
 }
 
 func (c *ModelScopeClient) handleStreamResponse(resp *http.Response) (string, error) {
@@ -248,6 +347,21 @@ func NewOpenAICompatibleClient(apiKey, baseURL, model string) *OpenAICompatibleC
 }
 
 func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := validatePrompt(prompt); err != nil {
+		return "", err
+	}
+	if err := validateProviderBaseURL(c.BaseURL); err != nil {
+		return "", err
+	}
+	if err := validateProviderIdentity(c.Model, c.APIKey); err != nil {
+		return "", err
+	}
+	if err := validateProviderTransport(c.BaseURL, c.APIKey); err != nil {
+		return "", err
+	}
 	options, err := resolveOptions(opts...)
 	if err != nil {
 		return "", err
@@ -272,7 +386,10 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 		reqBody["max_tokens"] = options.MaxTokens
 	}
 
-	jsonData, _ := json.Marshal(reqBody)
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode provider request")
+	}
 	url := openAIEndpoint(c.BaseURL, "chat/completions")
 
 	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
@@ -293,12 +410,15 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 	if resp.StatusCode != http.StatusOK {
 		return "", providerHTTPError(resp)
 	}
+	if err := validateProviderContentType(resp, useStream); err != nil {
+		return "", err
+	}
 
 	if useStream {
 		return c.handleStreamResponse(resp)
 	}
 
-	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	body, err := readBoundedUTF8Response(resp.Body, maxLLMResponseBytes)
 	if err != nil {
 		return "", err
 	}
@@ -308,21 +428,29 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, prompt string, op
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+			Index        *int   `json:"index"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := unmarshalProviderJSON(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no response")
+	if len(result.Choices) != 1 {
+		return "", fmt.Errorf("provider response must contain exactly one choice")
+	}
+	if err := validateSingleChoice(len(result.Choices), result.Choices[0].Index); err != nil {
+		return "", err
+	}
+	if err := validateFinishReason(result.Choices[0].FinishReason); err != nil {
+		return "", err
 	}
 
 	content := result.Choices[0].Message.Content
 	// Handle Qwen thinking mode
-	if content == "" && result.Choices[0].Message.ReasoningContent != "" {
+	if strings.TrimSpace(content) == "" && strings.TrimSpace(result.Choices[0].Message.ReasoningContent) != "" {
 		content = extractNarrative(result.Choices[0].Message.ReasoningContent)
 	}
-	return content, nil
+	return requireProviderText(content)
 }
 
 func (c *OpenAICompatibleClient) handleStreamResponse(resp *http.Response) (string, error) {
@@ -330,27 +458,78 @@ func (c *OpenAICompatibleClient) handleStreamResponse(resp *http.Response) (stri
 }
 
 const (
+	maxLLMPromptRunes     = 1_000_000
 	maxErrorResponseBytes = 64 << 10
 	maxLLMResponseBytes   = 16 << 20
 	maxStreamEventBytes   = 1 << 20
+	maxStreamInputBytes   = 16 << 20
 	maxStreamOutputBytes  = 16 << 20
 )
 
-func providerHTTPError(resp *http.Response) error {
-	body, err := readBoundedResponse(resp.Body, maxErrorResponseBytes)
-	if err != nil {
-		body = []byte(err.Error())
+func validateProviderContentType(resp *http.Response, streaming bool) error {
+	if len(resp.Header.Values("Content-Type")) != 1 || len(resp.Header.Values("Content-Encoding")) != 0 {
+		return fmt.Errorf("provider returned unsupported response headers")
 	}
-	retryAfter := time.Duration(0)
-	if seconds, parseErr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); parseErr == nil && seconds > 0 {
-		retryAfter = time.Duration(seconds) * time.Second
-	} else if retryAt, dateErr := http.ParseTime(resp.Header.Get("Retry-After")); dateErr == nil {
-		retryAfter = time.Until(retryAt)
-		if retryAfter < 0 {
-			retryAfter = 0
+	mediaType, parameters, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return fmt.Errorf("provider returned an unsupported content type")
+	}
+	if len(parameters) > 1 {
+		return fmt.Errorf("provider returned an unsupported content type")
+	}
+	if len(parameters) == 1 {
+		charset, exists := parameters["charset"]
+		if !exists || !strings.EqualFold(strings.TrimSpace(charset), "utf-8") {
+			return fmt.Errorf("provider returned an unsupported content type")
 		}
 	}
-	return &ProviderHTTPError{StatusCode: resp.StatusCode, Body: string(body), RetryAfter: retryAfter}
+	mediaType = strings.ToLower(mediaType)
+	if streaming {
+		if mediaType == "text/event-stream" {
+			return nil
+		}
+	} else if mediaType == "application/json" || strings.HasSuffix(mediaType, "+json") {
+		return nil
+	}
+	return fmt.Errorf("provider returned an unsupported content type")
+}
+
+func parseRetryAfter(values []string, now time.Time) time.Duration {
+	if len(values) != 1 {
+		return 0
+	}
+	value := strings.TrimSpace(values[0])
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseUint(value, 10, 32); err == nil {
+		if seconds == 0 {
+			return 0
+		}
+		if seconds >= uint64(maxLLMRetryBackoff/time.Second) {
+			return maxLLMRetryBackoff
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil || !retryAt.After(now) {
+		return 0
+	}
+	delay := retryAt.Sub(now)
+	if delay > maxLLMRetryBackoff {
+		return maxLLMRetryBackoff
+	}
+	return delay
+}
+
+func providerHTTPError(resp *http.Response) error {
+	// Drain only a bounded error body so the connection can be reused, then
+	// discard it immediately. Provider diagnostics may echo private content.
+	_, _ = readBoundedResponse(resp.Body, maxErrorResponseBytes)
+	return &ProviderHTTPError{
+		StatusCode: resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp.Header.Values("Retry-After"), time.Now()),
+	}
 }
 
 func readBoundedResponse(reader io.Reader, maxBytes int64) ([]byte, error) {
@@ -364,20 +543,138 @@ func readBoundedResponse(reader io.Reader, maxBytes int64) ([]byte, error) {
 	return body, nil
 }
 
+const (
+	maxProviderJSONDepth      = 64
+	maxProviderJSONEntries    = 10000
+	maxProviderJSONTotalNodes = 20000
+)
+
+type providerJSONComplexity struct {
+	totalNodes int
+}
+
+func scanProviderJSON(decoder *json.Decoder, depth int, complexity *providerJSONComplexity) error {
+	if depth > maxProviderJSONDepth {
+		return fmt.Errorf("provider JSON nesting exceeds limit")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		complexity.totalNodes++
+		if complexity.totalNodes > maxProviderJSONTotalNodes {
+			return fmt.Errorf("provider JSON structure exceeds limit")
+		}
+		return nil
+	}
+	entries := 0
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			entries++
+			complexity.totalNodes++
+			if entries > maxProviderJSONEntries || complexity.totalNodes > maxProviderJSONTotalNodes {
+				return fmt.Errorf("provider JSON structure exceeds limit")
+			}
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("provider JSON object key is invalid")
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("provider JSON contains duplicate keys")
+			}
+			seen[key] = struct{}{}
+			if err := scanProviderJSON(decoder, depth+1, complexity); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			entries++
+			complexity.totalNodes++
+			if entries > maxProviderJSONEntries || complexity.totalNodes > maxProviderJSONTotalNodes {
+				return fmt.Errorf("provider JSON structure exceeds limit")
+			}
+			if err := scanProviderJSON(decoder, depth+1, complexity); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("provider JSON delimiter is invalid")
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func unmarshalProviderJSON(body []byte, destination interface{}) error {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return fmt.Errorf("provider returned an invalid JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	if err := scanProviderJSON(decoder, 1, &providerJSONComplexity{}); err != nil {
+		return fmt.Errorf("provider returned an invalid JSON object")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("provider returned an invalid JSON object")
+	}
+	if err := json.Unmarshal(body, destination); err != nil {
+		return fmt.Errorf("provider returned an invalid JSON object")
+	}
+	return nil
+}
+
+func readBoundedUTF8Response(reader io.Reader, maxBytes int64) ([]byte, error) {
+	body, err := readBoundedResponse(reader, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if !utf8.Valid(body) {
+		return nil, fmt.Errorf("provider returned invalid UTF-8")
+	}
+	return body, nil
+}
+
 func decodeOpenAIStream(reader io.Reader) (string, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), maxStreamEventBytes)
 	var content, reasoning strings.Builder
+	finishReason := ""
+	completed := false
+	inputBytes := 0
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		inputBytes += len(scanner.Bytes()) + 1
+		if inputBytes > maxStreamInputBytes {
+			return "", fmt.Errorf("stream response exceeds %d input bytes", maxStreamInputBytes)
+		}
+		if !utf8.Valid(scanner.Bytes()) {
+			return "", fmt.Errorf("provider returned invalid UTF-8")
+		}
+		line := strings.TrimSuffix(scanner.Text(), "\r")
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if completed {
+			return "", fmt.Errorf("stream response contained data after completion")
+		}
+		if !strings.HasPrefix(line, "data:") {
+			return "", fmt.Errorf("provider returned an unsupported SSE field")
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if line == "" {
+			return "", fmt.Errorf("provider returned an empty SSE data field")
 		}
 		if line == "[DONE]" {
-			break
+			completed = true
+			continue
 		}
 		var event struct {
 			Choices []struct {
@@ -385,16 +682,24 @@ func decodeOpenAIStream(reader io.Reader) (string, error) {
 					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+				Index        *int   `json:"index"`
 			} `json:"choices"`
 		}
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := unmarshalProviderJSON([]byte(line), &event); err != nil {
 			return "", fmt.Errorf("failed to parse stream event: %w", err)
 		}
 		if len(event.Choices) == 0 {
 			continue
 		}
+		if err := validateSingleChoice(len(event.Choices), event.Choices[0].Index); err != nil {
+			return "", err
+		}
 		content.WriteString(event.Choices[0].Delta.Content)
 		reasoning.WriteString(event.Choices[0].Delta.ReasoningContent)
+		if event.Choices[0].FinishReason != "" {
+			finishReason = event.Choices[0].FinishReason
+		}
 		if content.Len()+reasoning.Len() > maxStreamOutputBytes {
 			return "", fmt.Errorf("stream response exceeds %d bytes", maxStreamOutputBytes)
 		}
@@ -402,11 +707,17 @@ func decodeOpenAIStream(reader io.Reader) (string, error) {
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("failed to read stream response: %w", err)
 	}
-	if content.Len() > 0 {
-		return content.String(), nil
+	if !completed {
+		return "", fmt.Errorf("stream response ended before completion")
 	}
-	if reasoning.Len() > 0 {
-		return extractNarrative(reasoning.String()), nil
+	if err := validateFinishReason(finishReason); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content.String()) != "" {
+		return requireProviderText(content.String())
+	}
+	if strings.TrimSpace(reasoning.String()) != "" {
+		return requireProviderText(extractNarrative(reasoning.String()))
 	}
 	return "", fmt.Errorf("stream response contained no content")
 }
@@ -436,6 +747,21 @@ func NewOllamaClient(baseURL, model string) *OllamaClient {
 }
 
 func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := validatePrompt(prompt); err != nil {
+		return "", err
+	}
+	if err := validateProviderBaseURL(c.BaseURL); err != nil {
+		return "", err
+	}
+	if err := validateProviderIdentity(c.Model, ""); err != nil {
+		return "", err
+	}
+	if err := validateProviderTransport(c.BaseURL, ""); err != nil {
+		return "", err
+	}
 	options, err := resolveOptions(opts...)
 	if err != nil {
 		return "", err
@@ -456,7 +782,10 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Opti
 		}
 	}
 
-	jsonData, _ := json.Marshal(reqBody)
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode provider request")
+	}
 	url := c.BaseURL + "/api/generate"
 
 	req, err := http.NewRequestWithContext(requestCtx, "POST", url, bytes.NewBuffer(jsonData))
@@ -474,21 +803,21 @@ func (c *OllamaClient) Generate(ctx context.Context, prompt string, opts ...Opti
 	if resp.StatusCode != http.StatusOK {
 		return "", providerHTTPError(resp)
 	}
+	if err := validateProviderContentType(resp, false); err != nil {
+		return "", err
+	}
 
-	body, err := readBoundedResponse(resp.Body, maxLLMResponseBytes)
+	body, err := readBoundedUTF8Response(resp.Body, maxLLMResponseBytes)
 	if err != nil {
 		return "", err
 	}
 	var result struct {
 		Response string `json:"response"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := unmarshalProviderJSON(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-	if result.Response == "" {
-		return "", fmt.Errorf("no response")
-	}
-	return result.Response, nil
+	return requireProviderText(result.Response)
 }
 
 func (c *OllamaClient) GenerateJSON(ctx context.Context, prompt string, opts ...Option) (map[string]interface{}, error) {
@@ -506,64 +835,34 @@ type Client struct {
 	Model    string
 }
 
-func NewClient(provider, apiKey, baseURL, model string) *Client {
+func NewClient(provider, apiKey, baseURL, model string) (*Client, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	apiKey = strings.TrimSpace(apiKey)
+	baseURL = strings.TrimSpace(baseURL)
+	model = strings.TrimSpace(model)
+	if baseURL == "" || model == "" {
+		return nil, fmt.Errorf("LLM endpoint and model are required")
+	}
+	if apiKey != "" && !strings.HasPrefix(strings.ToLower(baseURL), "https://") {
+		return nil, fmt.Errorf("LLM credentials require an HTTPS endpoint")
+	}
+	if (provider == "modelscope" || provider == "openai") && apiKey == "" {
+		return nil, fmt.Errorf("remote LLM provider requires credentials")
+	}
+
 	var p Provider
-
-	// 如果没有指定 baseURL，从环境变量获取
-	if baseURL == "" {
-		switch provider {
-		case "ollama":
-			baseURL = os.Getenv("OLLAMA_BASE_URL")
-			if baseURL == "" {
-				baseURL = "http://localhost:11434"
-			}
-		case "sglang":
-			baseURL = os.Getenv("SGLANG_BASE_URL")
-			if baseURL == "" {
-				baseURL = "http://localhost:30000"
-			}
-		case "llama":
-			baseURL = os.Getenv("LLAMA_BASE_URL")
-			if baseURL == "" {
-				baseURL = "http://10.0.0.200:8080"
-			}
-		case "modelscope":
-			baseURL = os.Getenv("MODELSCOPE_BASE_URL")
-			if baseURL == "" {
-				baseURL = "https://coding.dashscope.aliyuncs.com/v1"
-			}
-		}
-	}
-
-	// 如果没有指定 model，从环境变量获取
-	if model == "" {
-		model = os.Getenv("LLM_MODEL")
-	}
-
 	switch provider {
 	case "ollama":
-		// Ollama 使用原生 API
 		p = NewOllamaClient(baseURL, model)
 	case "sglang", "llama", "openai":
-		// SGLang, llama.cpp, OpenAI 使用 OpenAI 兼容 API
-		if apiKey == "" {
-			apiKey = "sk-dummy"
-		}
 		p = NewOpenAICompatibleClient(apiKey, baseURL, model)
 	case "modelscope":
 		p = NewModelScopeClient(apiKey, baseURL, model)
 	default:
-		// 默认使用 OpenAI 兼容 API
-		if apiKey == "" {
-			apiKey = "sk-dummy"
-		}
-		p = NewOpenAICompatibleClient(apiKey, baseURL, model)
+		return nil, fmt.Errorf("unsupported LLM provider")
 	}
 
-	return &Client{
-		Provider: p,
-		Model:    model,
-	}
+	return &Client{Provider: p, Model: model}, nil
 }
 
 func (c *Client) Generate(ctx context.Context, prompt string, opts ...Option) (string, error) {
@@ -574,9 +873,26 @@ func (c *Client) GenerateJSON(ctx context.Context, prompt string, opts ...Option
 	return c.Provider.GenerateJSON(ctx, prompt, opts...)
 }
 
+func retryBackoff(attempt int, retryAfter time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := time.Second
+	for index := 0; index < attempt && delay < maxLLMRetryBackoff; index++ {
+		delay *= 2
+	}
+	if retryAfter > delay {
+		delay = retryAfter
+	}
+	if delay > maxLLMRetryBackoff {
+		return maxLLMRetryBackoff
+	}
+	return delay
+}
+
 func (c *Client) GenerateWithRetry(ctx context.Context, prompt string, maxRetries int, opts ...Option) (string, error) {
-	if maxRetries < 0 {
-		maxRetries = 0
+	if maxRetries < 0 || maxRetries > maxLLMRetries {
+		return "", fmt.Errorf("max retries must be between 0 and %d", maxLLMRetries)
 	}
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -591,12 +907,12 @@ func (c *Client) GenerateWithRetry(ctx context.Context, prompt string, maxRetrie
 		if attempt == maxRetries || !isRetryableProviderError(err) {
 			return "", err
 		}
-		delay := time.Duration(1<<uint(attempt)) * time.Second
+		var retryAfter time.Duration
 		var httpErr *ProviderHTTPError
-		if errors.As(err, &httpErr) && httpErr.RetryAfter > delay {
-			delay = httpErr.RetryAfter
+		if errors.As(err, &httpErr) {
+			retryAfter = httpErr.RetryAfter
 		}
-		timer := time.NewTimer(delay)
+		timer := time.NewTimer(retryBackoff(attempt, retryAfter))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -621,6 +937,45 @@ func isRetryableProviderError(err error) bool {
 
 // ========== Helper Functions ==========
 
+func validatePrompt(prompt string) error {
+	if !utf8.ValidString(prompt) {
+		return fmt.Errorf("prompt must be valid UTF-8")
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("prompt must not be empty")
+	}
+	if utf8.RuneCountInString(prompt) > maxLLMPromptRunes {
+		return fmt.Errorf("prompt exceeds %d characters", maxLLMPromptRunes)
+	}
+	return nil
+}
+
+func validateSingleChoice(count int, index *int) error {
+	if count != 1 {
+		return fmt.Errorf("provider response must contain exactly one choice")
+	}
+	if index != nil && *index != 0 {
+		return fmt.Errorf("provider response contains an unexpected choice index")
+	}
+	return nil
+}
+
+func validateFinishReason(reason string) error {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length", "content_filter":
+		return fmt.Errorf("provider response was not completed")
+	default:
+		return nil
+	}
+}
+
+func requireProviderText(content string) (string, error) {
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("provider response contained no content")
+	}
+	return content, nil
+}
+
 func extractJSONObject(content string) (string, error) {
 	content = strings.TrimSpace(content)
 	if strings.HasPrefix(content, "```") {
@@ -636,11 +991,47 @@ func extractJSONObject(content string) (string, error) {
 	if arrayStart >= 0 && (objectStart < 0 || arrayStart < objectStart) {
 		return "", fmt.Errorf("top-level JSON value must be an object")
 	}
-	objectEnd := strings.LastIndex(content, "}")
-	if objectStart < 0 || objectEnd < objectStart {
+	if objectStart < 0 {
 		return "", fmt.Errorf("JSON object not found")
 	}
-	return content[objectStart : objectEnd+1], nil
+	depth := 0
+	inString := false
+	escaped := false
+	for index := objectStart; index < len(content); index++ {
+		current := content[index]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch current {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch current {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				remainder := strings.TrimSpace(content[index+1:])
+				if strings.HasPrefix(remainder, "{") || strings.HasPrefix(remainder, "[") {
+					return "", fmt.Errorf("multiple JSON values found")
+				}
+				return content[objectStart : index+1], nil
+			}
+			if depth < 0 {
+				return "", fmt.Errorf("invalid JSON object boundary")
+			}
+		}
+	}
+	return "", fmt.Errorf("unterminated JSON object")
 }
 
 func parseJSONResponse(content string) (map[string]interface{}, error) {
@@ -649,16 +1040,11 @@ func parseJSONResponse(content string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 	var result map[string]interface{}
-	decoder := json.NewDecoder(strings.NewReader(jsonStr))
-	if err := decoder.Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	if err := unmarshalProviderJSON([]byte(jsonStr), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: invalid structured output")
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("failed to parse JSON: top-level object is empty")
-	}
-	var extra interface{}
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("failed to parse JSON: multiple top-level values")
 	}
 	return result, nil
 }

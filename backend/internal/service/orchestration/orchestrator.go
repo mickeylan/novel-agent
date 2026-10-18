@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -173,7 +174,7 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 	if request.RevisionThreshold == 0 {
 		request.RevisionThreshold = 6.0
 	}
-	if request.RevisionThreshold < 0 || request.RevisionThreshold > 10 {
+	if math.IsNaN(request.RevisionThreshold) || math.IsInf(request.RevisionThreshold, 0) || request.RevisionThreshold < 0 || request.RevisionThreshold > 10 {
 		return nil, fmt.Errorf("revision threshold must be between 0 and 10")
 	}
 
@@ -189,6 +190,10 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 	})
 	if err != nil {
 		return nil, err
+	}
+	draft = strings.TrimSpace(draft)
+	if draft == "" {
+		return nil, fmt.Errorf("writer returned empty content")
 	}
 	result.Draft, result.Candidate = draft, draft
 
@@ -206,6 +211,9 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 	if err != nil {
 		return nil, err
 	}
+	if err := validateWorkflowAudit(result.Audit); err != nil {
+		return nil, err
+	}
 	result.Passed = result.Audit.OverallScore >= request.RevisionThreshold
 
 	if request.AutoRevise && !result.Passed {
@@ -216,6 +224,13 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 		if err != nil {
 			return nil, err
 		}
+		if result.Revision == nil {
+			return nil, fmt.Errorf("reviser returned no result")
+		}
+		result.Revision.Candidate = strings.TrimSpace(result.Revision.Candidate)
+		if result.Revision.Candidate == "" {
+			return nil, fmt.Errorf("reviser returned empty content")
+		}
 		if !result.Revision.Fallback && result.Revision.Candidate != draft {
 			result.Candidate = result.Revision.Candidate
 			result.Revised = true
@@ -223,6 +238,9 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 			result.CandidateAudit, err = o.critic.AuditChapter(ctx, result.Candidate, request.PreviousChapter, request.Outline)
 			result.Steps = append(result.Steps, stepFromError("reaudit", stepStarted, err))
 			if err != nil {
+				return nil, err
+			}
+			if err := validateWorkflowAudit(result.CandidateAudit); err != nil {
 				return nil, err
 			}
 			result.Passed = result.CandidateAudit.OverallScore >= request.RevisionThreshold
@@ -269,13 +287,30 @@ func (o *Orchestrator) PreviewChapter(ctx context.Context, request PreviewReques
 		stepStarted = time.Now()
 		result.DataChanges, err = o.dataAgent.ExtractPreview(ctx, request.ChapterNumber, result.Candidate, request.MemoryContext)
 		result.Steps = append(result.Steps, stepFromError("data_extract", stepStarted, err))
-		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
+		if err != nil || result.DataChanges == nil {
+			// Data extraction is advisory. Preserve the candidate while exposing only
+			// a stable code; Provider/decoder details must not enter API responses.
+			result.DataChanges = nil
+			result.Errors = append(result.Errors, "data_extract_failed")
+			if err == nil {
+				result.Steps[len(result.Steps)-1].Status = "failed"
+				result.Steps[len(result.Steps)-1].Error = "step_failed"
+			}
 		}
 	}
 
 	result.ExecutionTimeMS = time.Since(started).Milliseconds()
 	return result, nil
+}
+
+func validateWorkflowAudit(audit *agents.AuditResult) error {
+	if audit == nil {
+		return fmt.Errorf("critic returned no audit result")
+	}
+	if math.IsNaN(audit.OverallScore) || math.IsInf(audit.OverallScore, 0) || audit.OverallScore < 0 || audit.OverallScore > 10 {
+		return fmt.Errorf("critic returned an invalid score")
+	}
+	return nil
 }
 
 func buildQualityGate(result *ChapterWorkflowPreview) QualityGate {
@@ -334,7 +369,7 @@ func stepFromError(name string, started time.Time, err error) StepResult {
 	step := StepResult{Name: name, Status: "completed", DurationMS: time.Since(started).Milliseconds()}
 	if err != nil {
 		step.Status = "failed"
-		step.Error = err.Error()
+		step.Error = "step_failed"
 	}
 	return step
 }

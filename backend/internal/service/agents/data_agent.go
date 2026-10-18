@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"novel-agent/internal/service/llm"
@@ -162,15 +163,51 @@ func trimNonEmptyStrings(values []string) []string {
 }
 
 func normalizeExtraction(preview *DataExtractionPreview) {
-	preview.StateChanges = filterStateChanges(preview.StateChanges)
-	preview.WorldFacts = filterStateChanges(preview.WorldFacts)
+	preview.StateChanges = filterStateChanges(preview.StateChanges, map[string]bool{"character": true, "organization": true, "item": true})
+	preview.WorldFacts = filterStateChanges(preview.WorldFacts, map[string]bool{"world": true})
 	preview.NewEntities = filterNewEntities(preview.NewEntities)
 	preview.ResourceChanges = filterResourceChanges(preview.ResourceChanges)
 	preview.Hooks = filterHooks(preview.Hooks)
 	preview.Subplots = filterSubplots(preview.Subplots)
 }
 
+func allowedValue(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func trimNonEmptyStringsFiltered(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func trimStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if key != "" && value != "" {
+			result[key] = value
+		}
+	}
+	return result
+}
+
 func normalizeConfidence(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
 	if value < 0 {
 		return 0
 	}
@@ -180,12 +217,13 @@ func normalizeConfidence(value float64) float64 {
 	return value
 }
 
-func filterStateChanges(items []StateChange) []StateChange {
+func filterStateChanges(items []StateChange, allowedTypes map[string]bool) []StateChange {
 	out := make([]StateChange, 0, len(items))
 	for _, item := range items {
-		item.EntityName, item.Field, item.NewValue, item.Evidence = strings.TrimSpace(item.EntityName), strings.TrimSpace(item.Field), strings.TrimSpace(item.NewValue), strings.TrimSpace(item.Evidence)
+		item.EntityType = strings.ToLower(strings.TrimSpace(item.EntityType))
+		item.EntityName, item.Field, item.OldValue, item.NewValue, item.Evidence = strings.TrimSpace(item.EntityName), strings.TrimSpace(item.Field), strings.TrimSpace(item.OldValue), strings.TrimSpace(item.NewValue), strings.TrimSpace(item.Evidence)
 		item.Confidence = normalizeConfidence(item.Confidence)
-		if item.EntityName != "" && item.Field != "" && item.NewValue != "" && item.Evidence != "" {
+		if allowedTypes[item.EntityType] && item.EntityName != "" && item.Field != "" && item.NewValue != "" && item.Evidence != "" {
 			out = append(out, item)
 		}
 	}
@@ -195,9 +233,11 @@ func filterStateChanges(items []StateChange) []StateChange {
 func filterNewEntities(items []NewEntity) []NewEntity {
 	out := make([]NewEntity, 0, len(items))
 	for _, item := range items {
-		item.Name, item.Evidence = strings.TrimSpace(item.Name), strings.TrimSpace(item.Evidence)
+		item.EntityType = strings.ToLower(strings.TrimSpace(item.EntityType))
+		item.Name, item.Description, item.Evidence = strings.TrimSpace(item.Name), strings.TrimSpace(item.Description), strings.TrimSpace(item.Evidence)
+		item.Attributes = trimStringMap(item.Attributes)
 		item.Confidence = normalizeConfidence(item.Confidence)
-		if item.Name != "" && item.Evidence != "" {
+		if allowedValue(item.EntityType, "character", "organization", "item", "location") && item.Name != "" && item.Description != "" && item.Evidence != "" {
 			out = append(out, item)
 		}
 	}
@@ -207,9 +247,10 @@ func filterNewEntities(items []NewEntity) []NewEntity {
 func filterResourceChanges(items []ResourceChange) []ResourceChange {
 	out := make([]ResourceChange, 0, len(items))
 	for _, item := range items {
-		item.CharacterName, item.ResourceName, item.CurrentValue, item.Evidence = strings.TrimSpace(item.CharacterName), strings.TrimSpace(item.ResourceName), strings.TrimSpace(item.CurrentValue), strings.TrimSpace(item.Evidence)
+		item.ResourceType = strings.ToLower(strings.TrimSpace(item.ResourceType))
+		item.CharacterName, item.ResourceName, item.PreviousValue, item.CurrentValue, item.Evidence = strings.TrimSpace(item.CharacterName), strings.TrimSpace(item.ResourceName), strings.TrimSpace(item.PreviousValue), strings.TrimSpace(item.CurrentValue), strings.TrimSpace(item.Evidence)
 		item.Confidence = normalizeConfidence(item.Confidence)
-		if item.CharacterName != "" && item.ResourceName != "" && item.CurrentValue != "" && item.Evidence != "" {
+		if allowedValue(item.ResourceType, "item", "ability", "status", "currency") && item.CharacterName != "" && item.ResourceName != "" && item.CurrentValue != "" && item.Evidence != "" {
 			out = append(out, item)
 		}
 	}
@@ -219,9 +260,12 @@ func filterResourceChanges(items []ResourceChange) []ResourceChange {
 func filterHooks(items []HookCandidate) []HookCandidate {
 	out := make([]HookCandidate, 0, len(items))
 	for _, item := range items {
+		item.HookType, item.Priority = strings.ToLower(strings.TrimSpace(item.HookType)), strings.ToLower(strings.TrimSpace(item.Priority))
 		item.Description, item.Evidence = strings.TrimSpace(item.Description), strings.TrimSpace(item.Evidence)
+		item.RelatedCharacters = trimNonEmptyStringsFiltered(item.RelatedCharacters)
 		item.Confidence = normalizeConfidence(item.Confidence)
-		if item.Description != "" && item.Evidence != "" {
+		validChapter := item.ExpectedResolutionChapter == nil || *item.ExpectedResolutionChapter > 0
+		if allowedValue(item.HookType, "foreshadowing", "mystery", "promise") && allowedValue(item.Priority, "low", "medium", "high") && validChapter && item.Description != "" && item.Evidence != "" {
 			out = append(out, item)
 		}
 	}
@@ -231,9 +275,11 @@ func filterHooks(items []HookCandidate) []HookCandidate {
 func filterSubplots(items []SubplotChange) []SubplotChange {
 	out := make([]SubplotChange, 0, len(items))
 	for _, item := range items {
+		item.ChangeType, item.Status = strings.ToLower(strings.TrimSpace(item.ChangeType)), strings.ToLower(strings.TrimSpace(item.Status))
 		item.Name, item.Description, item.Evidence = strings.TrimSpace(item.Name), strings.TrimSpace(item.Description), strings.TrimSpace(item.Evidence)
+		item.Characters = trimNonEmptyStringsFiltered(item.Characters)
 		item.Confidence = normalizeConfidence(item.Confidence)
-		if item.Name != "" && item.Description != "" && item.Evidence != "" {
+		if allowedValue(item.ChangeType, "introduced", "advanced", "resolved") && allowedValue(item.Status, "active", "resolved") && item.Name != "" && item.Description != "" && item.Evidence != "" {
 			out = append(out, item)
 		}
 	}
